@@ -1,149 +1,350 @@
+"""
+Weekly FPL transfer and squad recommendation.
+
+Predictions are computed on stable player `code` and resolved to this season's
+element ids only at the point of talking to the API, so a season rollover cannot
+silently attach one player's form to another's name.
+"""
+
+import argparse
+
 import pandas as pd
-from data_fetcher import get_bootstrap_static, get_user_team, get_current_gameweek, get_fixtures
-from ml_model import prepare_data, train_model, get_latest_features
+
+import chips
+import data_fetcher
+import features
+import identity
+import ml_model
 from optimizer import optimize_squad
 
-def main():
-    print("Fetching static data from FPL...")
-    bootstrap = get_bootstrap_static()
-    elements = pd.DataFrame(bootstrap['elements'])
-    
-    # Map API columns to optimizer expected columns
-    elements['element_id'] = elements['id']
-    elements['position'] = elements['element_type']
-    elements['value'] = elements['now_cost']
-    
-    current_gw = get_current_gameweek(bootstrap)
-    print(f"Current Gameweek is basically {current_gw}")
-    
-    # We want to predict for the current GW if it's upcoming, or next if it's started
-    # The API 'is_next' gives the one to predict.
-    
-    team_id = 8936155
-    print(f"Fetching user team {team_id}...")
-    
-    # Fetch team from previous/current GW to get the squad
-    # Usually if GW has not started, entry API might not allow fetching upcoming picks.
-    # So we fetch for current_gw - 1 or current_gw. We'll try current_gw, then fall back.
-    user_team_data = get_user_team(team_id, current_gw)
-    if not user_team_data and current_gw > 1:
-         user_team_data = get_user_team(team_id, current_gw - 1)
-         
-    current_squad_ids = []
-    if user_team_data:
-        current_squad_ids = [pick['element'] for pick in user_team_data['picks']]
-        bank = user_team_data['entry_history']['bank']
-        squad_value = sum(elements[elements['element_id'].isin(current_squad_ids)]['value'])
-        budget = squad_value + bank
-        print(f"Found current squad. Total Budget available: {budget/10:.1f}m")
-    else:
-        print("Could not fetch user team Picks. Defaulting to 100.0m Wildcard.")
-        budget = 1000
-    
-    print("\nTraining ML Model on historical data... (this may take a few seconds)")
-    file_paths = [
-        "data/historical/data/2024-25/gws/merged_gw.csv",
-        "data/historical/data/2025-26/gws/merged_gw.csv"
-    ]
-    model_data, feature_cols, full_data = prepare_data(file_paths)
-    model = train_model(model_data, feature_cols)
-    
-    # Build fixture difficulty map for the upcoming gameweek from live API data
-    print("\nFetching live fixture data for difficulty ratings...")
-    team_next_difficulty_map = {}
-    try:
-        fixtures = get_fixtures()
-        next_gw = current_gw  # current_gw is the upcoming GW to predict for
-        next_gw_fixtures = [f for f in fixtures if f.get('event') == next_gw]
-        for fix in next_gw_fixtures:
-            team_next_difficulty_map[fix['team_h']] = fix['team_h_difficulty']
-            team_next_difficulty_map[fix['team_a']] = fix['team_a_difficulty']
-        print(f"  Mapped difficulty for {len(team_next_difficulty_map)} teams in GW{next_gw}")
-    except Exception as e:
-        print(f"  Warning: Could not fetch live fixtures: {e}. Using default difficulty.")
-    
-    print("\nGenerating predictions for next Gameweek...")
-    latest_features = get_latest_features(full_data, feature_cols, team_next_difficulty_map=team_next_difficulty_map)
-    latest_features['predicted_points'] = model.predict(latest_features[feature_cols])
-    
-    if 'element' in latest_features.columns:
-        latest_features['element_id'] = latest_features['element']
-    
-    feature_cols_to_merge = ['element_id', 'predicted_points', 'total_points_rolling_3', 'minutes_rolling_3']
-    for col in feature_cols_to_merge:
-        if col not in latest_features.columns and col != 'element_id':
-            latest_features[col] = 0.0
-            
-    merged_data = pd.merge(elements, latest_features[feature_cols_to_merge], on='element_id', how='left')
-    merged_data['predicted_points'] = merged_data['predicted_points'].fillna(0)
-    merged_data['total_points_rolling_3'] = merged_data['total_points_rolling_3'].fillna(0)
-    merged_data['minutes_rolling_3'] = merged_data['minutes_rolling_3'].fillna(0)
-    
-    print("\n--- Running Optimization ---")
-    free_transfers = 1  # Default to 1 free transfer; could be fetched from API in future
-    if current_squad_ids:
-        n_options = 3
-        hard_max = 4  # Allow up to 4 transfers if the point gain justifies the hit
-        print(f"Finding top {n_options} optimal transfer plans (up to {hard_max} transfers, {free_transfers} free)...")
-        optimal_squads = optimize_squad(
-            merged_data,
-            free_transfers=free_transfers,
-            current_squad_ids=current_squad_ids,
-            budget=budget,
-            n=n_options,
-            hard_max_transfers=hard_max
+DEFAULT_TEAM_ID = 7246903
+TRAINING_SEASONS = ["2024-25", "2025-26", "2026-27"]
+
+
+def build_player_table(bootstrap, panel, model, feature_cols, season, min_chance, gameweek):
+    """
+    Join model predictions onto the live player list.
+
+    The join runs through `code`, and unmatched players are reported rather than
+    silently zero-filled -- a large unmatched count means the historical data has
+    fallen behind the live season.
+    """
+    elements = pd.DataFrame(bootstrap["elements"])
+    elements["element_id"] = elements["id"].astype(int)
+    elements["code"] = elements["code"].astype(int)
+    elements["position"] = elements["element_type"].astype(int)
+    elements["value"] = elements["now_cost"].astype(int)
+
+    latest = features.latest_rows(panel, season)
+    if latest.empty:
+        raise RuntimeError(
+            f"No rows for season {season} in the historical data. "
+            "Update data/historical (git pull) before running."
         )
-        
-        if optimal_squads:
-            print(f"\n🏆 Top {len(optimal_squads)} Suggested Transfer Options:")
-            for idx, optimal_squad in enumerate(optimal_squads, 1):
-                new_squad_ids = set(optimal_squad['element_id'])
-                old_squad_ids = set(current_squad_ids)
-                
-                transfers_out = old_squad_ids - new_squad_ids
-                transfers_in = new_squad_ids - old_squad_ids
-                num_transfers = len(transfers_out)
-                extra_hits = max(0, num_transfers - free_transfers)
-                point_cost = extra_hits * 4
-                
-                if not transfers_out and not transfers_in:
-                    print(f"\nOption {idx}: Your current squad is mathematically optimal! No transfers recommended.")
-                    continue
-                    
-                print(f"\n--- Option {idx} ({num_transfers} transfer{'s' if num_transfers > 1 else ''}) ---")
-                if point_cost > 0:
-                    print(f"  ⚠️  POINT HIT: -{point_cost} points ({extra_hits} extra transfer{'s' if extra_hits > 1 else ''} beyond free)")
-                else:
-                    print(f"  ✅ FREE transfer - no point hit")
-                    
-                for tid_out, tid_in in zip(transfers_out, transfers_in):
-                    p_out = merged_data[merged_data['element_id'] == tid_out].iloc[0]
-                    p_in = merged_data[merged_data['element_id'] == tid_in].iloc[0]
-                    
-                    print(f"  🔻 OUT: {p_out['web_name']} (£{p_out['value']/10:.1f}m)")
-                    print(f"  🔺 IN:  {p_in['web_name']} (£{p_in['value']/10:.1f}m)")
-                    
-                    point_diff = p_in['predicted_points'] - p_out['predicted_points']
-                    print(f"  💡 WHY? -> Gains an estimated {point_diff:+.2f} points next gameweek.")
-                    print(f"     📊 Form Comparison (Avg per game over last 3 GWs):")
-                    print(f"        {p_out['web_name']}: {p_out['total_points_rolling_3']:.1f} pts (Played {p_out['minutes_rolling_3']:.0f} mins/gw)")
-                    print(f"        {p_in['web_name']}: {p_in['total_points_rolling_3']:.1f} pts (Played {p_in['minutes_rolling_3']:.0f} mins/gw)")
-                
-                if point_cost > 0:
-                    total_gain = sum(
-                        merged_data[merged_data['element_id'] == tid_in].iloc[0]['predicted_points'] -
-                        merged_data[merged_data['element_id'] == tid_out].iloc[0]['predicted_points']
-                        for tid_out, tid_in in zip(transfers_out, transfers_in)
-                    )
-                    net_gain = total_gain - point_cost
-                    print(f"  📈 NET GAIN after -{point_cost}pt hit: {net_gain:+.2f} points")
+
+    # Form should run through the gameweek immediately before the one we plan
+    # for. Anything older means the recommendation is built on stale form.
+    form_gw = int(latest["GW"].max())
+    if form_gw < gameweek - 1:
+        print(f"  WARNING: form data ends at GW{form_gw} but planning GW{gameweek} - "
+              f"{gameweek - 1 - form_gw} gameweek(s) stale")
+
+    # The upcoming gameweek's fixtures are published, so fill that context from
+    # the live list rather than leaving it null on the season's last row.
+    fixtures = data_fetcher.get_fixtures()
+    latest = features.apply_upcoming_fixtures(latest, fixtures, gameweek)
+    blanks = int((latest["next_fixture_count"] == 0).sum())
+    doubles = int((latest["next_fixture_count"] >= 2).sum())
+    print(f"  GW{gameweek} fixtures: {blanks} players blank, {doubles} on a double")
+
+    latest = ml_model.predict(model, latest, feature_cols)
+
+    carry = [
+        "code",
+        "predicted_points",
+        "total_points_rolling_3",
+        "minutes_rolling_3",
+        "start_rate_5",
+        "career_gws",
+        "GW",
+    ]
+    merged = elements.merge(
+        latest[carry].rename(columns={"GW": "form_through_gw"}), on="code", how="left"
+    )
+
+    matched = merged["predicted_points"].notna().sum()
+    for col in ["predicted_points", "total_points_rolling_3", "minutes_rolling_3",
+                "start_rate_5", "career_gws"]:
+        merged[col] = merged[col].fillna(0.0)
+
+    availability = data_fetcher.availability_frame(bootstrap, min_chance=min_chance)
+    merged = merged.merge(
+        availability[["element_id", "is_available", "status_label", "availability_factor"]],
+        on="element_id",
+        how="left",
+    )
+    merged["is_available"] = merged["is_available"].fillna(False)
+
+    return merged, matched
+
+
+def apply_availability_gate(players, current_squad_ids):
+    """
+    Remove players who cannot play the upcoming gameweek.
+
+    Players already in the squad are retained regardless of status, so the
+    optimizer can decide whether an injured asset is worth transferring out
+    rather than being forced to sell.
+    """
+    keep = players["is_available"] | players["element_id"].isin(current_squad_ids or [])
+    gated = players[keep].copy()
+
+    # An unavailable player already in the squad is worth zero this week.
+    unavailable_held = ~gated["is_available"]
+    gated.loc[unavailable_held, "predicted_points"] = 0.0
+    return gated, int((~keep).sum())
+
+
+def apply_evidence_gate(players, current_squad_ids, min_evidence):
+    """
+    Refuse to transfer *in* a player the model has barely seen.
+
+    This is a policy constraint on the action, not a correction to the
+    prediction. Shrinking the features toward a prior was tried first and made no
+    measurable difference (see features.DEFAULT_SHRINK); the failure it targeted
+    is not really a bad estimate, it is acting on an estimate built from one
+    appearance. Constraining the decision addresses that directly and leaves the
+    predictions honest.
+
+    Players already held are exempt -- the gate governs buying, not keeping.
+    """
+    if min_evidence <= 0:
+        return players, 0
+
+    held = set(current_squad_ids or [])
+    thin = (players["career_gws"] < min_evidence) & (~players["element_id"].isin(held))
+    return players[~thin].copy(), int(thin.sum())
+
+
+def pair_transfers(out_ids, in_ids, players):
+    """
+    Pair outgoing with incoming players by position.
+
+    A valid transfer set preserves the 2/5/5/3 squad shape, so the positions
+    leaving match the positions arriving and pairing within position is
+    well-defined. Zipping the raw id sets, as the previous version did, paired
+    players in arbitrary hash order and produced rationales that described
+    swaps that were not being proposed.
+    """
+    indexed = players.set_index("element_id")
+    pairs = []
+    for position in sorted(indexed.loc[list(out_ids), "position"].unique()):
+        outs = [i for i in out_ids if indexed.at[i, "position"] == position]
+        ins = [i for i in in_ids if indexed.at[i, "position"] == position]
+        outs.sort(key=lambda i: indexed.at[i, "predicted_points"])
+        ins.sort(key=lambda i: indexed.at[i, "predicted_points"])
+        pairs.extend(zip(outs, ins))
+    return pairs
+
+
+def describe_transfers(option_index, squad, current_squad_ids, players, free_transfers):
+    new_ids = set(squad["element_id"])
+    old_ids = set(current_squad_ids)
+    out_ids, in_ids = old_ids - new_ids, new_ids - old_ids
+
+    if not out_ids:
+        print(f"\nOption {option_index}: no transfer improves on the current squad.")
+        return
+
+    n_transfers = len(out_ids)
+    hits = max(0, n_transfers - free_transfers)
+    cost = hits * 4
+
+    print(f"\n--- Option {option_index} ({n_transfers} transfer{'s' if n_transfers > 1 else ''}) ---")
+    if cost:
+        print(f"  Point hit: -{cost} ({hits} beyond the {free_transfers} free)")
     else:
-        print("Running Wildcard optimization...")
-        optimal_squad = optimize_squad(merged_data, free_transfers=15, current_squad_ids=None, budget=budget)
-        if optimal_squad is not None:
-            print("\n⭐️ Optimal Wildcard Squad:")
-            for _, p in optimal_squad.sort_values(by='position').iterrows():
-                print(f"[{p['position']}] {p['web_name']} - £{p['value']/10:.1f}m | Pred: {p['predicted_points']:.2f}")
+        print("  Free transfer, no hit")
+
+    indexed = players.set_index("element_id")
+    total_gain = 0.0
+    for out_id, in_id in pair_transfers(out_ids, in_ids, players):
+        out_p, in_p = indexed.loc[out_id], indexed.loc[in_id]
+        gain = in_p["predicted_points"] - out_p["predicted_points"]
+        total_gain += gain
+
+        print(f"  OUT {out_p['web_name']:<16} £{out_p['value'] / 10:>4.1f}m  "
+              f"pred {out_p['predicted_points']:>5.2f}  [{out_p['status_label']}]")
+        print(f"  IN  {in_p['web_name']:<16} £{in_p['value'] / 10:>4.1f}m  "
+              f"pred {in_p['predicted_points']:>5.2f}  [{in_p['status_label']}]")
+        print(f"      net {gain:+.2f} pts | form(3gw) "
+              f"{out_p['total_points_rolling_3']:.1f} -> {in_p['total_points_rolling_3']:.1f} pts, "
+              f"mins {out_p['minutes_rolling_3']:.0f} -> {in_p['minutes_rolling_3']:.0f}")
+
+    print(f"  Expected gain {total_gain:+.2f}, after hit {total_gain - cost:+.2f} pts")
+
+
+def report_chips(squad_ids, players, gameweek, bootstrap, used=()):
+    """
+    Say whether a chip is worth playing this week, and why.
+
+    The same rule the backtest uses: value each legal chip in expected points and
+    compare against a bar that decays to zero at the end of its window. Chips
+    already used this season are passed in via `used`, since the public API does
+    not report a manager's remaining chips.
+    """
+    if not squad_ids:
+        return
+
+    windows = chips.windows_from_bootstrap(bootstrap)
+    state = chips.ChipState(windows)
+    for code in used:
+        state.mark_played(code, gameweek)
+
+    playable = state.available(gameweek)
+    if not playable:
+        print("\nChips: none available this gameweek.")
+        return
+
+    predictions = dict(zip(players["element_id"], players["predicted_points"]))
+    held = [i for i in squad_ids if i in predictions]
+
+    gains = {
+        "TC": chips.triple_captain_gain(held, predictions),
+        "BB": chips.bench_boost_gain(held, predictions),
+    }
+
+    print(f"\nChips available in GW{gameweek}:")
+    recommended = []
+    for _, code, weeks_left in playable:
+        if code not in gains:
+            # Wildcard and free hit are valued against a full rebuild, which the
+            # weekly run does not solve for; flag them rather than guess.
+            print(f"  {code}: available ({weeks_left} gameweeks left in window) "
+                  f"- run --wildcard to value a rebuild")
+            continue
+        bar = state.threshold(code, gameweek)
+        verdict = "PLAY" if gains[code] >= bar else "hold"
+        if verdict == "PLAY":
+            recommended.append(code)
+        print(f"  {code}: worth {gains[code]:.1f} pts, bar {bar:.1f} "
+              f"({weeks_left} gameweeks left) -> {verdict}")
+
+    if recommended:
+        print(f"  => consider playing {', '.join(recommended)} this week")
+
+
+def print_squad(squad):
+    captain = squad[squad["is_captain"]]
+    starters = squad[squad["is_starter"]].sort_values("position")
+    bench = squad[~squad["is_starter"]].sort_values("position")
+
+    print("\n  Starting XI:")
+    for _, p in starters.iterrows():
+        mark = " (C)" if bool(p["is_captain"]) else ""
+        print(f"    [{identity.ID_TO_POSITION[p['position']]}] {p['web_name']:<16}"
+              f"£{p['value'] / 10:>4.1f}m  pred {p['predicted_points']:>5.2f}{mark}")
+    if not bench.empty:
+        print("  Bench:")
+        for _, p in bench.iterrows():
+            print(f"    [{identity.ID_TO_POSITION[p['position']]}] {p['web_name']:<16}"
+                  f"£{p['value'] / 10:>4.1f}m  pred {p['predicted_points']:>5.2f}")
+    if not captain.empty:
+        print(f"\n  Captain: {captain.iloc[0]['web_name']} "
+              f"({captain.iloc[0]['predicted_points']:.2f} pred -> "
+              f"{captain.iloc[0]['predicted_points'] * 2:.2f} doubled)")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="FPL transfer recommendations.")
+    parser.add_argument("--team-id", type=int, default=DEFAULT_TEAM_ID)
+    parser.add_argument("--free-transfers", type=int, default=1)
+    parser.add_argument("--max-transfers", type=int, default=3)
+    parser.add_argument("--options", type=int, default=3)
+    parser.add_argument("--model", default=ml_model.DEFAULT_MODEL, choices=ml_model.SELECTABLE)
+    parser.add_argument("--min-chance", type=int, default=75,
+                        help="exclude doubtful players below this %% chance of playing")
+    parser.add_argument("--min-evidence", type=int, default=0,
+                        help="minimum career gameweeks before a player can be bought. "
+                             "Off by default: it looks sensible but measured worse over "
+                             "the 2025-26 backtest at every threshold tried "
+                             "(1934 ungated vs 1865 at 5, 1921 at 10 and 20)")
+    parser.add_argument("--wildcard", action="store_true", help="ignore current squad and rebuild")
+    parser.add_argument("--chips-used", nargs="*", default=[], metavar="CODE",
+                        choices=["WC", "FH", "BB", "TC"],
+                        help="chips already played this season (the API does not report them)")
+    args = parser.parse_args()
+
+    bootstrap = data_fetcher.get_bootstrap_static()
+    season = identity.current_season_label(bootstrap)
+    current_gw = data_fetcher.get_current_gameweek(bootstrap)
+    print(f"Season {season}, planning GW{current_gw}")
+
+    squad_ids, budget = [], 1000
+    entry = data_fetcher.get_user_team(args.team_id, current_gw - 1) if current_gw > 1 else None
+    if entry:
+        squad_ids = [p["element"] for p in entry["picks"]]
+        bank = entry["entry_history"]["bank"]
+        elements = pd.DataFrame(bootstrap["elements"])
+        held = elements[elements["id"].isin(squad_ids)]
+        budget = int(held["now_cost"].sum()) + bank
+        print(f"Squad loaded from GW{current_gw - 1}. Budget £{budget / 10:.1f}m "
+              f"(bank £{bank / 10:.1f}m)")
+        print("  note: budget uses current prices; true selling price may be lower "
+              "on risen players")
+    else:
+        print("No squad found for the previous gameweek - running wildcard mode.")
+
+    if args.wildcard:
+        squad_ids = []
+
+    print(f"\nTraining {args.model} on {', '.join(TRAINING_SEASONS)}...")
+    fixtures = data_fetcher.get_fixtures()
+    labelled, feature_cols, panel = features.prepare(
+        TRAINING_SEASONS, bootstrap=bootstrap, fixtures=fixtures
+    )
+    model = ml_model.train_model(labelled, feature_cols, kind=args.model)
+    print(f"  {len(labelled):,} training rows, {len(feature_cols)} features")
+
+    players, matched = build_player_table(
+        bootstrap, panel, model, feature_cols, season, args.min_chance, current_gw
+    )
+    print(f"  matched {matched}/{len(players)} live players to historical form by code")
+
+    players, dropped = apply_availability_gate(players, squad_ids)
+    print(f"  availability gate removed {dropped} unavailable players")
+
+    players, thin = apply_evidence_gate(players, squad_ids, args.min_evidence)
+    if args.min_evidence > 0:
+        print(f"  evidence gate removed {thin} players with under "
+              f"{args.min_evidence} career gameweeks")
+
+    if squad_ids:
+        squads = optimize_squad(
+            players,
+            free_transfers=args.free_transfers,
+            current_squad_ids=squad_ids,
+            budget=budget,
+            n=args.options,
+            hard_max_transfers=args.max_transfers,
+        )
+        if not squads:
+            print("\nNo feasible squad found.")
+            return
+        print(f"\nTop {len(squads)} transfer plans:")
+        for index, squad in enumerate(squads, 1):
+            describe_transfers(index, squad, squad_ids, players, args.free_transfers)
+        print("\nRecommended squad (option 1):")
+        print_squad(squads[0])
+        report_chips(squad_ids, players, current_gw, bootstrap, args.chips_used)
+    else:
+        squads = optimize_squad(players, free_transfers=15, current_squad_ids=None, budget=budget)
+        if not squads:
+            print("\nNo feasible squad found.")
+            return
+        print("\nOptimal wildcard squad:")
+        print_squad(squads[0])
+
 
 if __name__ == "__main__":
     main()

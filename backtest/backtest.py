@@ -1,371 +1,464 @@
 #!/usr/bin/env python3
 """
-FPL Backtesting Framework
-Simulates model-recommended transfers from various switch points and compares
-cumulative points against actual performance via a worm graph.
+Full-season backtest.
+
+Replays a whole season gameweek by gameweek: pick a squad, take transfers, choose
+a starting XI and captain, score against what actually happened.
+
+Two corrections relative to the previous version. Prices are taken from the panel
+at the gameweek being simulated rather than from today's bootstrap, so a player who
+rose from 4.5 to 6.5 is not affordable at 6.5 in October. And identity runs on the
+stable player `code`, so a squad carried across a season boundary stays the same
+set of players.
+
+Per-gameweek manager picks are only served for the current season, so a completed
+season can only be compared against its final total, not week by week.
 """
 
-import sys
+import argparse
 import os
+import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PROJECT_DIR)
+sys.path.insert(0, SCRIPT_DIR)
 
 import pandas as pd
-import numpy as np
-import requests
-from sklearn.ensemble import GradientBoostingRegressor
-from ml_model import prepare_data
+
+import chips
+import features
+import ml_model
 from optimizer import optimize_squad
 from visualize import plot_worm_graph
 
-TEAM_ID = 8936155
-BASE_URL = "https://fantasy.premierleague.com/api"
-SWITCH_GWS = [10, 20, 30]
-CURRENT_GW = 31
+STARTING_BUDGET = 1000
+MAX_FREE_TRANSFERS = 5  # FPL banks up to five
+FORMATION_MIN = {1: 1, 2: 3, 3: 2, 4: 1}
+POSITION_QUOTA = {1: 2, 2: 5, 3: 5, 4: 3}
 
 
-# ──────────────────────────── Data Loading ────────────────────────────
+# ──────────────────────────── Season tables ────────────────────────────
 
-def fetch_bootstrap():
-    return requests.get(f"{BASE_URL}/bootstrap-static/").json()
+def season_tables(panel, season):
+    """
+    Per-gameweek lookups for one season.
 
-
-def get_user_history():
-    """Returns {gw: points} for the user's actual season."""
-    data = requests.get(f"{BASE_URL}/entry/{TEAM_ID}/history/").json()
-    return {gw['event']: gw['points'] for gw in data['current']}
-
-
-def get_user_squad_at_gw(gw):
-    """Returns (squad_ids, bank) for the user's team at a given GW."""
-    resp = requests.get(f"{BASE_URL}/entry/{TEAM_ID}/event/{gw}/picks/")
-    if resp.status_code == 200:
-        data = resp.json()
-        return [p['element'] for p in data['picks']], data['entry_history']['bank']
-    return None, None
+    Prices come from the panel so every decision is priced as at the gameweek it
+    was taken, which is the whole point of a backtest.
+    """
+    rows = panel[panel["season"] == season]
+    points = {(int(r.code), int(r.GW)): float(r.total_points) for r in rows.itertuples()}
+    minutes = {(int(r.code), int(r.GW)): float(r.minutes) for r in rows.itertuples()}
+    prices = {(int(r.code), int(r.GW)): float(r.value) for r in rows.itertuples()}
+    positions = dict(zip(rows["code"].astype(int), rows["position_id"].astype(int)))
+    teams = dict(zip(rows["code"].astype(int), rows["team_id"].astype(int)))
+    names = dict(zip(rows["code"].astype(int), rows["name"]))
+    return points, minutes, prices, positions, teams, names
 
 
-def load_player_gw_points():
-    """Build lookup: (element_id, gw) -> actual total_points."""
-    csv_path = os.path.join(PROJECT_DIR, 'data/historical/data/2025-26/gws/merged_gw.csv')
-    df = pd.read_csv(csv_path)
-    points = {}
-    for _, row in df.iterrows():
-        points[(int(row['element']), int(row['GW']))] = int(row['total_points'])
-
-    max_csv_gw = int(df['GW'].max())
-    for gw in range(max_csv_gw + 1, CURRENT_GW + 1):
-        print(f"  Fetching GW{gw} live data from API...")
-        resp = requests.get(f"{BASE_URL}/event/{gw}/live/")
-        if resp.status_code == 200:
-            for elem in resp.json()['elements']:
-                points[(elem['id'], gw)] = elem['stats']['total_points']
-    return points
+def price_at(prices, code, gw, fallback=50.0):
+    """Price at a gameweek, falling back to the most recent earlier price."""
+    for candidate in range(gw, 0, -1):
+        if (code, candidate) in prices:
+            return prices[(code, candidate)]
+    return fallback
 
 
-def build_elements_df(bootstrap):
-    """Build the elements DataFrame used by the optimizer."""
-    df = pd.DataFrame(bootstrap['elements'])
-    df['element_id'] = df['id']
-    df['position'] = df['element_type']
-    df['value'] = df['now_cost']
-    return df
+# ──────────────────────────── Scoring ────────────────────────────
+
+def apply_autosubs(starters, bench, minutes, positions, gw):
+    """
+    Replace starters who did not play with bench players who did.
+
+    FPL substitutes automatically in bench order, accepting a substitution only if
+    the resulting formation stays legal. Ignoring this understates every strategy,
+    since a blanked starter is silently worth zero.
+    """
+    played = [c for c in starters if minutes.get((c, gw), 0) > 0]
+    blanked = [c for c in starters if minutes.get((c, gw), 0) == 0]
+    if not blanked:
+        return starters
+
+    final = list(played)
+    available = [c for c in bench if minutes.get((c, gw), 0) > 0]
+
+    for out_code in blanked:
+        for i, in_code in enumerate(available):
+            candidate = final + [in_code]
+            if is_legal_xi(candidate, positions):
+                final.append(in_code)
+                available.pop(i)
+                break
+        else:
+            # No legal substitute: the slot stays empty and scores nothing.
+            continue
+
+    return final
 
 
-# ──────────────────────────── Model ────────────────────────────
-
-def train_model_at_gw(full_data, feature_cols, cutoff_gw):
-    """Train model using only data available before cutoff_gw."""
-    train_data = full_data[
-        (full_data['season_index'] == 0) |
-        ((full_data['season_index'] == 1) & (full_data['GW'] <= cutoff_gw - 2))
-    ].copy()
-    train_data = train_data.dropna(subset=['target_points'] + feature_cols)
-
-    if len(train_data) < 100:
-        print(f"    Warning: Only {len(train_data)} training rows")
-
-    X = train_data[feature_cols]
-    y = train_data['target_points']
-    model = GradientBoostingRegressor(
-        n_estimators=100,
-        max_depth=5,
-        learning_rate=0.1,
-        subsample=0.8,
-        random_state=42
-    )
-    model.fit(X, y)
-    return model
+def is_legal_xi(codes, positions):
+    """A starting XI is legal at up to 11 players with one keeper and a valid shape."""
+    if len(codes) > 11:
+        return False
+    counts = {p: 0 for p in POSITION_QUOTA}
+    for code in codes:
+        counts[positions.get(code, 3)] += 1
+    if counts[1] > 1:
+        return False
+    # Only enforce the minimums once the XI is full.
+    if len(codes) == 11:
+        return all(counts[p] >= minimum for p, minimum in FORMATION_MIN.items())
+    return True
 
 
-def get_predictions(model, full_data, feature_cols, cutoff_gw):
-    """Get element_id -> predicted_points for all players at a GW cutoff."""
-    data_up_to = full_data[
-        (full_data['season_index'] == 0) |
-        ((full_data['season_index'] == 1) & (full_data['GW'] < cutoff_gw))
-    ].copy()
+def score_gameweek(starters, bench, captain, gw, points, minutes, positions, chip=None):
+    """Points scored by a squad in one gameweek, after autosubs and captaincy."""
+    if chip == "BB":
+        scoring = list(starters) + list(bench)
+    else:
+        scoring = apply_autosubs(starters, bench, minutes, positions, gw)
 
-    latest = data_up_to.drop_duplicates(subset=['name'], keep='last').copy()
-
-    # Only keep current-season players
-    if 'season_index' in latest.columns:
-        latest = latest[latest['season_index'] == full_data['season_index'].max()]
-
-    if 'next_difficulty' in feature_cols:
-        latest['next_difficulty'] = latest['next_difficulty'].fillna(3)
-
-    latest = latest.dropna(subset=feature_cols)
-    if len(latest) == 0:
-        return {}
-
-    latest['predicted_points'] = model.predict(latest[feature_cols])
-
-    if 'element' in latest.columns:
-        return dict(zip(latest['element'].astype(int), latest['predicted_points']))
-    return {}
-
-
-def calc_gw_score(starting_11, captain, gw, player_gw_points):
-    """Sum of starting 11 actual points, captain doubled."""
-    total = 0
-    for pid in starting_11:
-        pts = player_gw_points.get((pid, gw), 0)
-        total += pts * 2 if pid == captain else pts
+    total = 0.0
+    for code in scoring:
+        scored = points.get((code, gw), 0.0)
+        if code == captain:
+            # Captaincy only doubles if the captain actually played; otherwise the
+            # armband passes to the vice, which we approximate as no multiplier.
+            multiplier = 3 if chip == "TC" else 2
+            if minutes.get((code, gw), 0) > 0:
+                scored *= multiplier
+        total += scored
     return total
 
 
 # ──────────────────────────── Simulation ────────────────────────────
 
-def simulate_path(switch_gw, full_data, feature_cols, player_gw_points,
-                  actual_points, elements_df, positions):
-    """Simulate one path: use model from switch_gw onward."""
-    print(f"\n{'='*50}")
-    print(f"  Simulating: switch to model at GW{switch_gw}")
-    print(f"{'='*50}")
+def train_for_gameweek(labelled, feature_cols, season_index, gw, kind):
+    """
+    Fit on rows whose outcome was known before this gameweek kicked off.
 
-    # Get squad from the GW before the switch (the team going into switch_gw)
-    squad_ids, bank = get_user_squad_at_gw(switch_gw - 1)
-    if squad_ids is None and switch_gw > 1:
-        squad_ids, bank = get_user_squad_at_gw(switch_gw)
-    if squad_ids is None:
-        print(f"  ❌ Could not fetch squad for GW{switch_gw}")
+    A row at GW t-2 is labelled with GW t-1's points, so that is the newest row
+    that can legitimately be trained on when predicting GW t.
+    """
+    train = labelled[
+        (labelled["season_index"] < season_index)
+        | ((labelled["season_index"] == season_index) & (labelled["GW"] <= gw - 2))
+    ]
+    if len(train) < 500:
         return None
+    return ml_model.train_model(train, feature_cols, kind=kind)
 
-    budget = sum(elements_df.set_index('element_id')['value'].to_dict().get(pid, 50)
-                 for pid in squad_ids) + (bank or 0)
+
+def predictions_for_gameweek(panel, feature_cols, model, season, gw):
+    """
+    Predicted points for every player, from their most recent row before `gw`.
+
+    The next-gameweek fixture columns on that row describe `gw` itself, which is
+    published in advance and so is legitimately available.
+    """
+    rows = panel[(panel["season"] == season) & (panel["GW"] == gw - 1)]
+    rows = rows.dropna(subset=feature_cols)
+    if rows.empty:
+        return {}
+    predicted = model.predict(rows[feature_cols])
+    return dict(zip(rows["code"].astype(int), predicted))
+
+
+def build_player_frame(codes, pred_map, prices, positions, teams, gw,
+                       evidence=None, min_evidence=0, held=()):
+    """
+    The optimizer's input for one gameweek, priced as at that gameweek.
+
+    `min_evidence` drops players with too few career gameweeks to be worth acting
+    on, except those already held.
+    """
+    held = set(held)
+    records = []
+    for code in codes:
+        if (
+            min_evidence
+            and evidence is not None
+            and code not in held
+            and evidence.get(code, 0) < min_evidence
+        ):
+            continue
+        records.append(
+            {
+                "element_id": int(code),
+                "predicted_points": float(pred_map.get(code, 0.0)),
+                "value": price_at(prices, code, gw),
+                "position": positions.get(code, 3),
+                "team": teams.get(code, 0),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def choose_chip(state, gw, squad, pred_map, frame, budget, free_transfers,
+                max_transfers, baseline_expected):
+    """
+    Decide which chip, if any, to play this gameweek.
+
+    Each candidate is scored by the extra expected points it would bring, then
+    compared against a bar that decays to zero at the end of that chip's window.
+    The best qualifying chip is played; ties go to the larger margin over the bar,
+    so a chip that is merely legal does not crowd out one that is genuinely due.
+    """
+    if not squad:
+        return None, None
+
+    playable = {code for _, code, _ in state.available(gw)}
+    if not playable:
+        return None, None
+
+    candidates = []
+
+    if "TC" in playable:
+        candidates.append(("TC", chips.triple_captain_gain(squad, pred_map), None))
+
+    if "BB" in playable:
+        candidates.append(("BB", chips.bench_boost_gain(squad, pred_map), None))
+
+    # Wildcard and free hit both need an unconstrained rebuild to value, so solve
+    # once and reuse it for whichever of the two is available.
+    if playable & {"WC", "FH"}:
+        rebuild = optimize_squad(frame, free_transfers=15, current_squad_ids=list(squad),
+                                 budget=budget, n=1, chip_active="WC")
+        if rebuild:
+            rebuilt = [int(c) for c in rebuild[0]["element_id"]]
+            gain = chips.expected_from_squad(rebuilt, pred_map) - baseline_expected
+            for code in ("WC", "FH"):
+                if code in playable:
+                    candidates.append((code, gain, rebuilt))
+
+    best = None
+    for code, gain, payload in candidates:
+        margin = gain - state.threshold(code, gw)
+        if margin >= 0 and (best is None or margin > best[1]):
+            best = (code, margin, payload)
+
+    if best is None:
+        return None, None
+    return best[0], best[2]
+
+
+def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
+             strategy="model", retrain_every=4, max_transfers=2, verbose=True,
+             min_evidence=0, use_chips=False, chip_windows=None, chip_thresholds=None):
+    """
+    Play a season under one strategy.
+
+    strategy 'model' re-optimizes every gameweek; 'hold' picks an opening squad
+    and never transfers again, which isolates how much the transfer engine is
+    actually worth.
+    """
+    points, minutes, prices, positions, teams, names = season_tables(panel, season)
+    season_index = int(panel.loc[panel["season"] == season, "season_index"].iloc[0])
+    codes = sorted({c for c, _ in points.keys()})
+
+    # Career gameweeks available to the model at each point in the season, used
+    # by the evidence gate. Taken as the count strictly before the gameweek.
+    evidence_rows = panel[panel["season_index"] <= season_index]
+
+    squad = None
+    bank = 0.0
     free_transfers = 1
-    
-    # Chip tracking
-    chips = {
-        'WC1': False, 'WC2': False, 'FH': False, 'BB': False, 'TC': False
-    }
-    
-    # Track pre-Free Hit squad
-    fh_saved_squad = None
-    fh_saved_budget = None
-
     gw_scores = {}
+    model = None
+    transfer_log = []
 
-    # Use actual points for GWs before switch
-    for gw in range(1, switch_gw):
-        gw_scores[gw] = actual_points.get(gw, 0)
+    chip_state = chips.ChipState(chip_windows, chip_thresholds) if use_chips else None
+    chip_log = []
+    free_hit_squad = None  # squad to restore the gameweek after a free hit
 
-    values = elements_df.set_index('element_id')['value'].to_dict()
+    for gw in range(first_gw, last_gw + 1):
+        if model is None or (gw - first_gw) % retrain_every == 0:
+            fresh = train_for_gameweek(labelled, feature_cols, season_index, gw, kind)
+            if fresh is not None:
+                model = fresh
+        if model is None:
+            continue
 
-    for gw in range(switch_gw, CURRENT_GW + 1):
-        print(f"    Training model on data up to GW{gw}...")
-        model = train_model_at_gw(full_data, feature_cols, gw)
-        pred_map = get_predictions(model, full_data, feature_cols, gw)
+        pred_map = predictions_for_gameweek(panel, feature_cols, model, season, gw)
+        if not pred_map:
+            continue
 
-        # Restore squad if Free Hit was played last week
-        if fh_saved_squad is not None:
-            squad_ids = fh_saved_squad
-            budget = fh_saved_budget
-            fh_saved_squad = None
-            fh_saved_budget = None
+        evidence = None
+        if min_evidence:
+            prior = evidence_rows[
+                (evidence_rows["season_index"] < season_index)
+                | ((evidence_rows["season_index"] == season_index)
+                   & (evidence_rows["GW"] < gw))
+            ]
+            evidence = prior.groupby("code").size().to_dict()
 
-        # Determine if we should play a chip this week
-        chip_active = None
-        
-        # 1. Triple Captain Heuristic: Captain predicted > 11 pts
-        if not chips['TC']:
-            best_pred = max([pred_map.get(pid, 0) for pid in squad_ids] + [0])
-            if best_pred > 11.0:
-                chip_active = 'TC'
-                chips['TC'] = True
-        
-        # 2. Bench Boost Heuristic: Bench predicted > 14 pts
-        if not chip_active and not chips['BB']:
-            # Sort squad by predicted points
-            sorted_squad = sorted(squad_ids, key=lambda pid: pred_map.get(pid, 0), reverse=True)
-            bench_pred_sum = sum(pred_map.get(pid, 0) for pid in sorted_squad[11:])
-            if bench_pred_sum > 14.0:
-                chip_active = 'BB'
-                chips['BB'] = True
-                
-        # 3. Wildcard Heuristic: 
-        if not chip_active:
-            if not chips['WC1'] and gw <= 19 and gw >= switch_gw + 3:
-                chip_active = 'WC'
-                chips['WC1'] = True
-            elif not chips['WC2'] and gw > 19 and gw >= 28:
-                chip_active = 'WC'
-                chips['WC2'] = True
-                
-        # 4. Free Hit Heuristic: If expected points of current squad is very low (< 35)
-        if not chip_active and not chips['FH']:
-            current_expected = sum(pred_map.get(pid, 0) for pid in sorted(squad_ids, key=lambda p: pred_map.get(p, 0), reverse=True)[:11])
-            if current_expected < 35.0:
-                chip_active = 'FH'
-                chips['FH'] = True
-                fh_saved_squad = list(squad_ids)
-                fh_saved_budget = budget
+        # A free hit lasts one gameweek; the previous squad returns afterwards.
+        if free_hit_squad is not None:
+            squad = free_hit_squad
+            free_hit_squad = None
 
-        if chip_active:
-            print(f"    🌟 PLAYING CHIP: {chip_active}")
+        frame = build_player_frame(codes, pred_map, prices, positions, teams, gw,
+                                   evidence=evidence, min_evidence=min_evidence,
+                                   held=squad or ())
 
-        # Build optimizer input
-        player_data = elements_df.copy()
-        player_data['predicted_points'] = player_data['element_id'].map(pred_map).fillna(0)
-
-        # Run optimizer
-        transfers_made = 0
-        penalty = 0
-        
-        starting_11 = []
-        captain = None
-        
-        try:
-            # For WC and FH, allow 15 transfers freely
-            opt_free_transfers = 15 if chip_active in ['WC', 'FH'] else free_transfers
-            opt_hard_max = 15 if chip_active in ['WC', 'FH'] else 3
-            
-            result = optimize_squad(
-                player_data,
-                free_transfers=opt_free_transfers,
-                current_squad_ids=squad_ids,
-                budget=budget,
-                n=1,
-                hard_max_transfers=opt_hard_max,
-                chip_active=chip_active
-            )
-            if result is not None:
-                new_ids = list(result['element_id'])
-                transfers_made = len(set(squad_ids) - set(new_ids))
-                
-                # Penalties don't apply on WC or FH
-                if chip_active in ['WC', 'FH']:
-                    extra = 0
-                else:
-                    extra = max(0, transfers_made - free_transfers)
-                    
-                penalty = extra * 4
-                squad_ids = new_ids
-                budget = sum(values.get(pid, 50) for pid in squad_ids) + (bank or 0)
-                
-                starting_11 = result[result['is_starter']]['element_id'].tolist()
-                caps = result[result['is_captain']]['element_id'].tolist()
-                captain = caps[0] if caps else None
-        except Exception as e:
-            print(f"    ⚠️ Optimizer error at GW{gw}: {e}")
-
-        # Update free transfers
-        if chip_active in ['WC', 'FH']:
-            free_transfers = 1 # Reverts to 1 after chip
-        elif transfers_made == 0:
-            free_transfers = min(2, free_transfers + 1)
+        chip = None
+        if squad is None:
+            # Opening squad: a full rebuild on the starting budget.
+            result = optimize_squad(frame, free_transfers=15, current_squad_ids=None,
+                                    budget=STARTING_BUDGET, n=1)
+            transfers_made, hit = 0, 0
+        elif strategy == "hold":
+            result = pick_xi_only(squad, frame)
+            transfers_made, hit = 0, 0
         else:
-            free_transfers = 1
+            budget = sum(price_at(prices, c, gw) for c in squad) + bank
+            result = optimize_squad(frame, free_transfers=free_transfers,
+                                    current_squad_ids=list(squad), budget=budget, n=1,
+                                    hard_max_transfers=max_transfers)
+            transfers_made, hit = 0, 0
 
-        # Fallback if optimization failed completely
-        if not starting_11:
-            sorted_squad = sorted(squad_ids, key=lambda pid: pred_map.get(pid, 0), reverse=True)
-            starting_11 = sorted_squad[:11]
-            captain = sorted_squad[0]
+            if chip_state is not None and result:
+                baseline = chips.expected_from_squad(
+                    [int(c) for c in result[0]["element_id"]], pred_map
+                )
+                chip, _ = choose_chip(chip_state, gw, squad, pred_map, frame, budget,
+                                      free_transfers, max_transfers, baseline)
+                if chip is not None:
+                    chip_state.mark_played(chip, gw)
+                    chip_log.append((gw, chip))
+                    if chip in ("WC", "FH"):
+                        # Unlimited transfers, no hit.
+                        result = optimize_squad(
+                            frame, free_transfers=15, current_squad_ids=list(squad),
+                            budget=budget, n=1, chip_active=chip,
+                        )
+                        if chip == "FH":
+                            free_hit_squad = list(squad)
 
-        # Calculate score
-        total = 0
-        
-        if chip_active == 'BB':
-            # Everyone scores
-            for pid in squad_ids:
-                total += player_gw_points.get((pid, gw), 0)
-        else:
-            for pid in starting_11:
-                pts = player_gw_points.get((pid, gw), 0)
-                if pid == captain:
-                    if chip_active == 'TC':
-                        total += pts * 3
-                    else:
-                        total += pts * 2
-                else:
-                    total += pts
-                    
-        score = total - penalty
+        if not result:
+            gw_scores[gw] = 0.0
+            continue
+        chosen = result[0]
 
-        gw_scores[gw] = score
-        t_str = f"{transfers_made}T" if transfers_made else "0T"
-        h_str = f" (-{penalty}pt hit)" if penalty > 0 else ""
-        print(f"    GW{gw:2d}: {score:3d} pts | {t_str}{h_str}")
+        new_squad = [int(c) for c in chosen["element_id"]]
+        if squad is not None and strategy != "hold":
+            outgoing = set(squad) - set(new_squad)
+            transfers_made = len(outgoing)
+            # Wildcard and free hit make every transfer free.
+            hit = 0 if chip in ("WC", "FH") else max(0, transfers_made - free_transfers) * 4
+            if transfers_made:
+                incoming = set(new_squad) - set(squad)
+                transfer_log.append(
+                    (gw, [names.get(c, c) for c in outgoing], [names.get(c, c) for c in incoming])
+                )
+            spent_before = sum(price_at(prices, c, gw) for c in squad) + bank
+            bank = spent_before - sum(price_at(prices, c, gw) for c in new_squad)
 
-    total = sum(gw_scores.get(gw, 0) for gw in range(1, CURRENT_GW + 1))
-    print(f"  📊 Total: {total} pts")
-    return gw_scores
+        squad = new_squad
+        starters = [int(c) for c in chosen[chosen["is_starter"]]["element_id"]]
+        bench = [c for c in squad if c not in starters]
+        captains = [int(c) for c in chosen[chosen["is_captain"]]["element_id"]]
+        captain = captains[0] if captains else None
+
+        raw = score_gameweek(starters, bench, captain, gw, points, minutes, positions,
+                             chip=chip)
+        gw_scores[gw] = raw - hit
+
+        if strategy != "hold":
+            if chip in ("WC", "FH"):
+                free_transfers = 1  # the chip does not consume the weekly transfer
+            else:
+                free_transfers = (
+                    min(MAX_FREE_TRANSFERS, free_transfers + 1) if transfers_made == 0 else 1
+                )
+
+        if verbose:
+            note = f" {transfers_made}T" if transfers_made else ""
+            note += f" (-{hit})" if hit else ""
+            note += f" [{chip}]" if chip else ""
+            print(f"    GW{gw:2d}: {gw_scores[gw]:6.1f}{note}")
+
+    return gw_scores, transfer_log, chip_log
+
+
+def pick_xi_only(squad, frame):
+    """
+    Choose the best legal XI and captain from a fixed squad.
+
+    Used by the hold strategy: no transfers, but the manager still picks a team.
+    """
+    held = frame[frame["element_id"].isin(squad)].copy()
+    if len(held) < 11:
+        return []
+    budget = float(held["value"].sum()) + 1e6
+    return optimize_squad(held, free_transfers=0, current_squad_ids=list(squad),
+                          budget=budget, n=1, hard_max_transfers=0)
 
 
 # ──────────────────────────── Main ────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description="Full-season FPL backtest.")
+    parser.add_argument("--season", default="2025-26")
+    parser.add_argument("--train-seasons", nargs="+", default=["2024-25", "2025-26"])
+    parser.add_argument("--first-gw", type=int, default=1)
+    parser.add_argument("--last-gw", type=int, default=38)
+    parser.add_argument("--model", default=ml_model.DEFAULT_MODEL, choices=ml_model.SELECTABLE)
+    parser.add_argument("--retrain-every", type=int, default=4)
+    parser.add_argument("--max-transfers", type=int, default=2)
+    parser.add_argument("--no-chips", dest="chips", action="store_false",
+                        help="disable chips; on by default, since the human total "
+                             "being compared against includes theirs")
+    parser.set_defaults(chips=True)
+    parser.add_argument("--actual-total", type=int, default=2151,
+                        help="manager's real total for the season, for comparison")
+    args = parser.parse_args()
+
     print("=" * 60)
-    print("  FPL Model Backtesting Framework")
+    print(f"  FPL backtest - {args.season} GW{args.first_gw}-{args.last_gw}")
     print("=" * 60)
 
-    # Load all data
-    print("\n📊 Loading data...")
-    bootstrap = fetch_bootstrap()
-    elements_df = build_elements_df(bootstrap)
-    actual_points = get_user_history()
-    player_gw_points = load_player_gw_points()
-    positions = dict(zip(elements_df['element_id'], elements_df['position']))
+    labelled, feature_cols, panel = features.prepare(args.train_seasons)
+    print(f"  {len(labelled):,} labelled rows, {len(feature_cols)} features")
 
-    # Prepare ML features (computed once on full data)
-    print("\n🔧 Preparing ML feature data...")
-    file_paths = [
-        os.path.join(PROJECT_DIR, 'data/historical/data/2024-25/gws/merged_gw.csv'),
-        os.path.join(PROJECT_DIR, 'data/historical/data/2025-26/gws/merged_gw.csv')
-    ]
-    _, feature_cols, full_data = prepare_data(file_paths)
+    strategies = [("model", "Model (weekly transfers)", args.chips),
+                  ("hold", "Hold (no transfers)", False)]
+    if args.chips:
+        strategies.insert(1, ("model", "Model (no chips)", False))
 
-    # Run simulations
-    model_paths = {}
-    for switch_gw in SWITCH_GWS:
-        gw_scores = simulate_path(
-            switch_gw, full_data, feature_cols, player_gw_points,
-            actual_points, elements_df, positions
+    runs = {}
+    for strategy, label, use_chips in strategies:
+        print(f"\n  {label}")
+        scores, log, chip_log = simulate(
+            panel, labelled, feature_cols, args.season,
+            args.first_gw, args.last_gw, args.model,
+            strategy=strategy, retrain_every=args.retrain_every,
+            max_transfers=args.max_transfers, verbose=False,
+            use_chips=use_chips,
         )
-        if gw_scores:
-            model_paths[switch_gw] = gw_scores
+        runs[label] = scores
+        total = sum(scores.values())
+        print(f"    total {total:.0f} over {len(scores)} gameweeks")
+        if strategy == "model":
+            print(f"    {len(log)} gameweeks with transfers")
+        if chip_log:
+            print("    chips: " + ", ".join(f"GW{g} {c}" for g, c in chip_log))
 
-    # Summary table
-    actual_total = sum(actual_points.get(gw, 0) for gw in range(1, CURRENT_GW + 1))
-    print(f"\n{'='*60}")
-    print(f"  SUMMARY")
-    print(f"{'='*60}")
-    print(f"  {'Path':<25} {'Total Pts':>10} {'vs Actual':>10}")
-    print(f"  {'-'*45}")
-    print(f"  {'Actual':<25} {actual_total:>10}")
-    for sw_gw in sorted(model_paths.keys()):
-        total = sum(model_paths[sw_gw].get(gw, 0) for gw in range(1, CURRENT_GW + 1))
-        diff = total - actual_total
-        print(f"  {'Model from GW' + str(sw_gw):<25} {total:>10} {diff:>+10}")
+    print(f"\n{'=' * 60}")
+    print("  SUMMARY")
+    print(f"{'=' * 60}")
+    print(f"  {'Strategy':<30}{'Total':>8}{'vs actual':>12}")
+    print(f"  {'-' * 50}")
+    print(f"  {'Actual (your 2025-26)':<30}{args.actual_total:>8}{'':>12}")
+    for label, scores in runs.items():
+        total = sum(scores.values())
+        print(f"  {label:<30}{total:>8.0f}{total - args.actual_total:>+12.0f}")
 
-    # Generate worm graph
-    output_path = os.path.join(SCRIPT_DIR, 'output', 'worm_graph.png')
-    plot_worm_graph(actual_points, model_paths, output_path, CURRENT_GW)
-
-    print("\n✅ Backtest complete!")
+    output = os.path.join(SCRIPT_DIR, "output", "worm_graph.png")
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    plot_worm_graph(runs, output, args.first_gw, args.last_gw, args.actual_total)
+    print("\n  done")
 
 
 if __name__ == "__main__":
