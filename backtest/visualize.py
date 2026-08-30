@@ -10,8 +10,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Categorical slots 1 and 2 of the reference palette, in fixed order.
-SERIES_COLORS = ["#2a78d6", "#eb6834"]
+# Categorical slots 1-3 of the reference palette, in fixed order. These three are
+# validated as a set for all-pairs separation; never cycle them, since a repeated
+# hue makes two distinct series read as one.
+SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]
 REFERENCE_COLOR = "#6f6e69"  # benchmark line: neutral, not a competing series
 SURFACE = "#fcfcfb"
 INK = "#0b0b0b"
@@ -53,8 +55,14 @@ def plot_worm_graph(runs, output_path, first_gw=1, last_gw=38, actual_total=None
                 linewidth=2.0, zorder=2,
                 label=f"Actual season total ({actual_total:,}) — even pace")
 
+    if len(runs) > len(SERIES_COLORS):
+        raise ValueError(
+            f"{len(runs)} series but only {len(SERIES_COLORS)} validated hues. "
+            "Add a validated slot or fold series together -- do not cycle."
+        )
+
     for index, (label, scores) in enumerate(runs.items()):
-        color = SERIES_COLORS[index % len(SERIES_COLORS)]
+        color = SERIES_COLORS[index]
         cumulative = _cumulative(scores, gameweeks)
         ax.plot(gameweeks, cumulative, color=color, linewidth=2.6, zorder=4 + index,
                 label=label, solid_capstyle="round")
