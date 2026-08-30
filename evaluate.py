@@ -150,6 +150,10 @@ def main():
     parser.add_argument("--last-gw", type=int, default=38)
     parser.add_argument("--step", type=int, default=2, help="evaluate every Nth gameweek")
     parser.add_argument("--model", default=ml_model.DEFAULT_MODEL, choices=sorted(ml_model.MODELS))
+    parser.add_argument("--no-shrink", action="store_true",
+                        help="disable form shrinkage (for A/B comparison)")
+    parser.add_argument("--k-career", type=float, default=features.DEFAULT_K_CAREER)
+    parser.add_argument("--k-position", type=float, default=features.DEFAULT_K_POSITION)
     args = parser.parse_args()
 
     print("=" * 60)
@@ -159,7 +163,13 @@ def main():
     print(f"  test season : {args.test_season} GW{args.first_gw}-{args.last_gw} (step {args.step})")
     print(f"  model       : {args.model}")
 
-    _, feature_cols, panel = features.prepare(args.seasons)
+    shrink = not args.no_shrink
+    print(f"  shrinkage   : {'off' if args.no_shrink else f'on (k_career={args.k_career}, k_position={args.k_position})'}")
+
+    _, feature_cols, panel = features.prepare(
+        args.seasons, shrink=shrink,
+        k_career=args.k_career, k_position=args.k_position,
+    )
     results, last_model = walk_forward(
         panel, feature_cols, args.test_season,
         args.first_gw, args.last_gw, args.model, args.step,

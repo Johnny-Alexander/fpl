@@ -277,7 +277,104 @@ def build_panel(seasons, bootstrap=None, fixtures=None):
     return panel
 
 
-def add_features(panel):
+# Stats whose rolling means are shrunk. Price is excluded: it is observed
+# exactly, so there is nothing to regularise -- shrinking a £15.5m striker toward
+# a positional average would simply be wrong.
+SHRINK_STATS = [s for s in ROLLING_STATS if s != "value"]
+
+# Pseudo-observations of the prior. K_CAREER governs how fast a rolling window
+# escapes the player's own career level; K_POSITION how fast a career average
+# escapes the positional baseline.
+DEFAULT_K_CAREER = 2.0
+DEFAULT_K_POSITION = 6.0
+
+# Off by default -- measured, not assumed. Walk-forward over 2025-26 GW4-38,
+# comparing the top-15 predicted players per gameweek and pairing the arms fold
+# by fold: mean realised 4.676 unshrunk vs 4.703 shrunk, better in only 16 of 35
+# gameweeks, paired t-test p=0.86, 95% CI [-0.27, +0.32]. MAE was ~1% worse in
+# every evidence segment. A pooled top-50 across folds *did* look like a large
+# gain, but that metric is dominated by a handful of gameweeks and did not
+# survive pairing.
+#
+# The likely reason it does nothing: from GW4 onward almost every player has
+# ample history, so there is little for a small-sample correction to fix. The
+# case it was built for -- the opening gameweeks of a season, where a newcomer
+# has one appearance -- is barely present in any test window we can construct,
+# so this stays available but unused rather than shipped on a hunch.
+DEFAULT_SHRINK = False
+
+
+def positional_priors(df, stats):
+    """
+    Per-position mean of each stat, for each season, computed from *earlier*
+    seasons only.
+
+    Using the whole panel would leak: the prior for 2025-26 would be informed by
+    how 2025-26 turned out. The oldest season has no earlier data and falls back
+    to its own means, which only ever affects training rows.
+    """
+    priors = {}
+    season_indices = sorted(df["season_index"].unique())
+    for season_index in season_indices:
+        earlier = df[df["season_index"] < season_index]
+        source = earlier if len(earlier) else df[df["season_index"] == season_index]
+        priors[season_index] = source.groupby("position_id")[stats].mean()
+    return priors
+
+
+def apply_shrinkage(df, k_position=DEFAULT_K_POSITION, k_career=DEFAULT_K_CAREER):
+    """
+    Shrink rolling form toward what is actually known about the player.
+
+    Two levels, because one is not enough. Shrinking a rolling mean straight to a
+    league baseline would punish an established player's hot streak exactly as
+    hard as it punishes a newcomer's single lucky afternoon, which is the opposite
+    of what the evidence supports.
+
+        career mean   <- shrunk toward the positional baseline, weighted by how
+                         many gameweeks the player has ever played
+        rolling mean  <- shrunk toward that career mean, weighted by the number
+                         of observations in the window
+
+    So a player with 76 gameweeks keeps almost all of their own signal and their
+    hot streak is judged against their own level; a player with one appearance is
+    pulled most of the way back to what a typical player in their position does.
+    """
+    priors = positional_priors(df, SHRINK_STATS)
+
+    # Positional baseline for each row, taken from earlier seasons.
+    prior_frame = pd.DataFrame(index=df.index, columns=SHRINK_STATS, dtype=float)
+    for season_index, table in priors.items():
+        mask = df["season_index"] == season_index
+        if not mask.any():
+            continue
+        positions = df.loc[mask, "position_id"]
+        for stat in SHRINK_STATS:
+            prior_frame.loc[mask, stat] = positions.map(table[stat]).to_numpy()
+    prior_frame = prior_frame.fillna(0.0)
+
+    grouped = df.groupby("code", sort=False)
+    career_n = df["career_gws"].to_numpy(dtype=float)
+
+    for stat in SHRINK_STATS:
+        career_sum = grouped[stat].cumsum().to_numpy(dtype=float)
+        prior = prior_frame[stat].to_numpy(dtype=float)
+
+        # Level 1: career average, regularised toward the positional baseline.
+        career_mean = (career_sum + k_position * prior) / (career_n + k_position)
+
+        # Level 2: each rolling window, regularised toward that career average.
+        for window in ROLLING_WINDOWS:
+            column = f"{stat}_rolling_{window}"
+            observed = df[column].to_numpy(dtype=float)
+            n = np.minimum(career_n, window)
+            df[column] = (n * observed + k_career * career_mean) / (n + k_career)
+
+    return df
+
+
+def add_features(panel, shrink=DEFAULT_SHRINK, k_position=DEFAULT_K_POSITION,
+                 k_career=DEFAULT_K_CAREER):
     """
     Derive backward-looking form features and the next-gameweek target.
 
@@ -299,12 +396,20 @@ def add_features(panel):
     df["next_was_home"] = by_code["was_home"].shift(-1)
     df.loc[next_season != df["season_index"], ["next_difficulty", "next_fixture_count", "next_was_home"]] = np.nan
 
+    # How much evidence exists for this player, counted across seasons. Used both
+    # as a feature and as the weight in the shrinkage below.
+    df["career_gws"] = df.groupby("code", sort=False).cumcount() + 1
+    df["log_career_gws"] = np.log1p(df["career_gws"])
+
     for stat in ROLLING_STATS:
         grouped = df.groupby("code", sort=False)[stat]
         for window in ROLLING_WINDOWS:
             df[f"{stat}_rolling_{window}"] = grouped.transform(
                 lambda s, w=window: s.rolling(w, min_periods=1).mean()
             )
+
+    if shrink:
+        df = apply_shrinkage(df, k_position=k_position, k_career=k_career)
 
     # Season-to-date totals, reset each season.
     by_season = df.groupby(["code", "season_index"], sort=False)
@@ -338,6 +443,11 @@ def feature_columns():
         "pts_per_min",
         "start_rate_5",
         "log_selected",
+        # log_career_gws is computed but deliberately not a feature. Handing the
+        # model an explicit evidence count cost 62 points over the 2025-26
+        # backtest (1996 -> 1934); `log_selected` already proxies for how
+        # established a player is, and the extra split appears to do more harm
+        # than good. The column stays available for the evidence gate.
         "position_id",
         "next_difficulty",
         "next_fixture_count",
@@ -346,14 +456,16 @@ def feature_columns():
     return cols
 
 
-def prepare(seasons, bootstrap=None, fixtures=None):
+def prepare(seasons, bootstrap=None, fixtures=None, shrink=DEFAULT_SHRINK,
+            k_position=DEFAULT_K_POSITION, k_career=DEFAULT_K_CAREER):
     """
     Build the panel and split it into (labelled training rows, feature names,
     full panel). The full panel retains unlabelled rows, which is what prediction
     for the upcoming gameweek needs.
     """
     panel = build_panel(seasons, bootstrap=bootstrap, fixtures=fixtures)
-    panel = add_features(panel)
+    panel = add_features(panel, shrink=shrink, k_position=k_position,
+                         k_career=k_career)
     cols = feature_columns()
     labelled = panel.dropna(subset=["target_points"] + cols).copy()
     return labelled, cols, panel

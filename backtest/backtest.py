@@ -164,10 +164,24 @@ def predictions_for_gameweek(panel, feature_cols, model, season, gw):
     return dict(zip(rows["code"].astype(int), predicted))
 
 
-def build_player_frame(codes, pred_map, prices, positions, teams, gw):
-    """The optimizer's input for one gameweek, priced as at that gameweek."""
+def build_player_frame(codes, pred_map, prices, positions, teams, gw,
+                       evidence=None, min_evidence=0, held=()):
+    """
+    The optimizer's input for one gameweek, priced as at that gameweek.
+
+    `min_evidence` drops players with too few career gameweeks to be worth acting
+    on, except those already held.
+    """
+    held = set(held)
     records = []
     for code in codes:
+        if (
+            min_evidence
+            and evidence is not None
+            and code not in held
+            and evidence.get(code, 0) < min_evidence
+        ):
+            continue
         records.append(
             {
                 "element_id": int(code),
@@ -181,7 +195,8 @@ def build_player_frame(codes, pred_map, prices, positions, teams, gw):
 
 
 def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
-             strategy="model", retrain_every=4, max_transfers=2, verbose=True):
+             strategy="model", retrain_every=4, max_transfers=2, verbose=True,
+             min_evidence=0):
     """
     Play a season under one strategy.
 
@@ -192,6 +207,10 @@ def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
     points, minutes, prices, positions, teams, names = season_tables(panel, season)
     season_index = int(panel.loc[panel["season"] == season, "season_index"].iloc[0])
     codes = sorted({c for c, _ in points.keys()})
+
+    # Career gameweeks available to the model at each point in the season, used
+    # by the evidence gate. Taken as the count strictly before the gameweek.
+    evidence_rows = panel[panel["season_index"] <= season_index]
 
     squad = None
     bank = 0.0
@@ -212,7 +231,18 @@ def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
         if not pred_map:
             continue
 
-        frame = build_player_frame(codes, pred_map, prices, positions, teams, gw)
+        evidence = None
+        if min_evidence:
+            prior = evidence_rows[
+                (evidence_rows["season_index"] < season_index)
+                | ((evidence_rows["season_index"] == season_index)
+                   & (evidence_rows["GW"] < gw))
+            ]
+            evidence = prior.groupby("code").size().to_dict()
+
+        frame = build_player_frame(codes, pred_map, prices, positions, teams, gw,
+                                   evidence=evidence, min_evidence=min_evidence,
+                                   held=squad or ())
 
         if squad is None:
             # Opening squad: a full rebuild on the starting budget.

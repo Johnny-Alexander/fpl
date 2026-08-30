@@ -64,6 +64,7 @@ def build_player_table(bootstrap, panel, model, feature_cols, season, min_chance
         "total_points_rolling_3",
         "minutes_rolling_3",
         "start_rate_5",
+        "career_gws",
         "GW",
     ]
     merged = elements.merge(
@@ -71,7 +72,8 @@ def build_player_table(bootstrap, panel, model, feature_cols, season, min_chance
     )
 
     matched = merged["predicted_points"].notna().sum()
-    for col in ["predicted_points", "total_points_rolling_3", "minutes_rolling_3", "start_rate_5"]:
+    for col in ["predicted_points", "total_points_rolling_3", "minutes_rolling_3",
+                "start_rate_5", "career_gws"]:
         merged[col] = merged[col].fillna(0.0)
 
     availability = data_fetcher.availability_frame(bootstrap, min_chance=min_chance)
@@ -100,6 +102,27 @@ def apply_availability_gate(players, current_squad_ids):
     unavailable_held = ~gated["is_available"]
     gated.loc[unavailable_held, "predicted_points"] = 0.0
     return gated, int((~keep).sum())
+
+
+def apply_evidence_gate(players, current_squad_ids, min_evidence):
+    """
+    Refuse to transfer *in* a player the model has barely seen.
+
+    This is a policy constraint on the action, not a correction to the
+    prediction. Shrinking the features toward a prior was tried first and made no
+    measurable difference (see features.DEFAULT_SHRINK); the failure it targeted
+    is not really a bad estimate, it is acting on an estimate built from one
+    appearance. Constraining the decision addresses that directly and leaves the
+    predictions honest.
+
+    Players already held are exempt -- the gate governs buying, not keeping.
+    """
+    if min_evidence <= 0:
+        return players, 0
+
+    held = set(current_squad_ids or [])
+    thin = (players["career_gws"] < min_evidence) & (~players["element_id"].isin(held))
+    return players[~thin].copy(), int(thin.sum())
 
 
 def pair_transfers(out_ids, in_ids, players):
@@ -190,6 +213,11 @@ def main():
     parser.add_argument("--model", default=ml_model.DEFAULT_MODEL, choices=sorted(ml_model.MODELS))
     parser.add_argument("--min-chance", type=int, default=75,
                         help="exclude doubtful players below this %% chance of playing")
+    parser.add_argument("--min-evidence", type=int, default=0,
+                        help="minimum career gameweeks before a player can be bought. "
+                             "Off by default: it looks sensible but measured worse over "
+                             "the 2025-26 backtest at every threshold tried "
+                             "(1934 ungated vs 1865 at 5, 1921 at 10 and 20)")
     parser.add_argument("--wildcard", action="store_true", help="ignore current squad and rebuild")
     args = parser.parse_args()
 
@@ -231,6 +259,11 @@ def main():
 
     players, dropped = apply_availability_gate(players, squad_ids)
     print(f"  availability gate removed {dropped} unavailable players")
+
+    players, thin = apply_evidence_gate(players, squad_ids, args.min_evidence)
+    if args.min_evidence > 0:
+        print(f"  evidence gate removed {thin} players with under "
+              f"{args.min_evidence} career gameweeks")
 
     if squad_ids:
         squads = optimize_squad(

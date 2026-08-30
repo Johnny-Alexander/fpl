@@ -59,6 +59,26 @@ player against 4.26 for the best naive predictor.
 **The backtest prices decisions at the gameweek they were taken.** Using today's
 prices lets the simulation buy a player at a price they only reached in April.
 
+## Things that were tried and did not work
+
+Recorded so they are not re-attempted. Early in a season the tool recommends
+players it has seen once, on the strength of a single big score. That looks
+obviously wrong. Three fixes were built and measured, and none of them helped.
+
+| Attempt | Result |
+|---|---|
+| Hierarchical shrinkage of form toward career, then positional, means | No effect. Top-15 per gameweek, paired over 35 folds: 4.676 → 4.703, better in 16/35, p=0.86, 95% CI [−0.27, +0.32]. MAE ~1% worse in every evidence segment. |
+| `log_career_gws` as a model feature | −62 points over the 2025-26 backtest (1996 → 1934). |
+| Minimum-evidence gate on transfers in | Worse at every threshold: 1934 ungated, 1865 at 5, 1921 at 10 and 20. |
+
+Both the shrinkage and the gate remain available behind flags
+(`features.DEFAULT_SHRINK`, `--min-evidence`) and are off by default.
+
+Two lessons worth keeping. A pooled top-50 across folds suggested shrinkage was
+a large win; pairing fold by fold showed it was noise, so prefer the paired test.
+And cheap, lightly-evidenced players are not obviously bad buys — they free
+budget for premiums, and blocking them cost points.
+
 **Known gaps.** Budget uses current price rather than selling price, which
 overstates funds on risen players (the public API does not expose selling price).
 The backtest has no historical injury data, so the availability gate is live-only.
