@@ -13,3 +13,6 @@ data/historical/
 backtest/output/
 
 *.log
+
+# Cached FPL API responses
+.cache/

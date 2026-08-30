@@ -1,4 +1,6 @@
 pandas
 requests
 scikit-learn
+scipy
 pulp
+matplotlib

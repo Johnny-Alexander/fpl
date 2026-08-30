@@ -1,58 +1,88 @@
-"""Worm graph visualization for FPL backtesting."""
+"""
+Worm graph for the season backtest.
+
+Light surface with strong gridlines and large type, sized to stay legible
+projected rather than on a laptop.
+"""
 
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Categorical slots 1 and 2 of the reference palette, in fixed order.
+SERIES_COLORS = ["#2a78d6", "#eb6834"]
+REFERENCE_COLOR = "#6f6e69"  # benchmark line: neutral, not a competing series
+SURFACE = "#fcfcfb"
+INK = "#0b0b0b"
+INK_SECONDARY = "#52514e"
+GRID = "#c9c8c2"
 
-def plot_worm_graph(actual_points, model_paths, output_path, current_gw=31):
+
+def _cumulative(scores, gameweeks):
+    running, out = 0.0, []
+    for gw in gameweeks:
+        running += scores.get(gw, 0.0)
+        out.append(running)
+    return out
+
+
+def plot_worm_graph(runs, output_path, first_gw=1, last_gw=38, actual_total=None):
     """
-    Generate a cricket-style worm graph comparing actual vs model paths.
-    
-    actual_points: dict {gw: points}
-    model_paths: dict {switch_gw: {gw: points}}
+    runs:         {label: {gameweek: points}}
+    actual_total: the manager's real season total, drawn as an even-pace reference.
+                  Per-gameweek history is not retrievable once a season ends, so
+                  only the endpoint is real -- the line between is interpolation
+                  and is labelled as such.
     """
-    fig, ax = plt.subplots(figsize=(14, 8))
-    gws = list(range(1, current_gw + 1))
-    
-    # Actual cumulative line
-    actual_cum = []
-    total = 0
-    for gw in gws:
-        total += actual_points.get(gw, 0)
-        actual_cum.append(total)
-    
-    ax.plot(gws, actual_cum, 'k-', linewidth=2.5, label='Actual', 
-            marker='o', markersize=4, zorder=10)
-    
-    # Model paths
-    colors = ['#e74c3c', '#e67e22', '#f1c40f', '#27ae60', '#3498db', '#8e44ad']
-    
-    for i, switch_gw in enumerate(sorted(model_paths.keys())):
-        gw_scores = model_paths[switch_gw]
-        model_cum = []
-        total = 0
-        for gw in gws:
-            total += gw_scores.get(gw, 0)
-            model_cum.append(total)
-        
-        ax.plot(gws, model_cum, '--', color=colors[i % len(colors)], linewidth=1.8,
-                label=f'Model from GW{switch_gw}', alpha=0.85, marker='s', markersize=3)
-        
-        # Mark the switch point
-        switch_idx = switch_gw - 1
-        if switch_idx < len(model_cum):
-            ax.axvline(x=switch_gw, color=colors[i % len(colors)], 
-                       alpha=0.2, linestyle=':', linewidth=1)
-    
-    ax.set_xlabel('Gameweek', fontsize=12)
-    ax.set_ylabel('Cumulative Points', fontsize=12)
-    ax.set_title('FPL Worm Graph: Actual vs Model-Recommended Transfers', fontsize=14, fontweight='bold')
-    ax.legend(loc='upper left', fontsize=10)
-    ax.grid(True, alpha=0.3)
-    ax.set_xticks(gws)
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    print(f"\n📈 Worm graph saved to {output_path}")
-    plt.close()
+    gameweeks = list(range(first_gw, last_gw + 1))
+
+    fig, ax = plt.subplots(figsize=(15, 8.5), facecolor=SURFACE)
+    ax.set_facecolor(SURFACE)
+
+    ax.grid(True, which="major", color=GRID, linewidth=1.1, alpha=0.9, zorder=0)
+    ax.set_axisbelow(True)
+
+    if actual_total:
+        pace = [
+            actual_total * (i + 1) / len(gameweeks) for i in range(len(gameweeks))
+        ]
+        # The endpoint is not labelled directly: the total is already named in the
+        # legend, and a strategy finishing near it would collide with that label.
+        ax.plot(gameweeks, pace, linestyle=(0, (6, 4)), color=REFERENCE_COLOR,
+                linewidth=2.0, zorder=2,
+                label=f"Actual season total ({actual_total:,}) — even pace")
+
+    for index, (label, scores) in enumerate(runs.items()):
+        color = SERIES_COLORS[index % len(SERIES_COLORS)]
+        cumulative = _cumulative(scores, gameweeks)
+        ax.plot(gameweeks, cumulative, color=color, linewidth=2.6, zorder=4 + index,
+                label=label, solid_capstyle="round")
+        ax.annotate(f"{cumulative[-1]:,.0f}", xy=(gameweeks[-1], cumulative[-1]),
+                    xytext=(8, 0), textcoords="offset points",
+                    color=color, fontsize=14, fontweight="bold", va="center")
+
+    ax.set_xlabel("Gameweek", fontsize=16, color=INK_SECONDARY, labelpad=10)
+    ax.set_ylabel("Cumulative points", fontsize=16, color=INK_SECONDARY, labelpad=10)
+    ax.set_title("FPL backtest: model-managed season vs actual",
+                 fontsize=21, fontweight="bold", color=INK, pad=18, loc="left")
+
+    ticks = [gw for gw in gameweeks if gw % 5 == 0 or gw in (first_gw, last_gw)]
+    ax.set_xticks(ticks)
+    ax.tick_params(axis="both", labelsize=13, colors=INK_SECONDARY, length=0)
+    ax.set_xlim(first_gw, last_gw + 1.8)
+
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_color(GRID)
+
+    legend = ax.legend(loc="upper left", fontsize=14, frameon=True,
+                       facecolor=SURFACE, edgecolor=GRID, borderpad=0.8)
+    for text in legend.get_texts():
+        text.set_color(INK_SECONDARY)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=SURFACE)
+    plt.close(fig)
+    print(f"  worm graph -> {output_path}")
