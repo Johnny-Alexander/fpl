@@ -122,15 +122,32 @@ obviously wrong, and fixing it did not help.
 | Hierarchical shrinkage of form toward career, then positional, means | No effect. Top-15 per gameweek, paired over 35 folds: 4.676 → 4.703, better in 16/35, p=0.86, 95% CI [−0.27, +0.32]. MAE ~1% worse in every evidence segment. |
 | `log_career_gws` as a model feature | −62 points over the 2025-26 backtest (1996 → 1934). |
 | Minimum-evidence gate on transfers in | Worse at every threshold: 1934 ungated, 1865 at 5, 1921 at 10 and 20. |
+| Multi-gameweek horizon (plan 3–8 weeks, transfer chain, banked free transfers) | Horizon 3 mean −30, better in 1 of 4 seasons; horizon 5 mean +23, better in 3 of 4 but p≈0.53. Diagnosis below. Available as `--horizon N` in the backtest, default 1. |
 | Two-stage model, P(60+ mins) × E[points \| played] | Marginally better at prediction (starters MAE 2.225 vs 2.238, rank ρ 0.363 vs 0.354) but no better at picking squads: top-15 paired over 29 folds 4.623 vs 4.577, p=0.76; backtest 1955 vs 1996. Kept as `--model two-stage` for its calibrated start probability. |
 
 Shrinkage, the evidence gate and the two-stage model all remain available behind
 flags (`features.DEFAULT_SHRINK`, `--min-evidence`, `--model two-stage`) and are
 off by default.
 
+**Why the horizon failed is the most useful thing here.** The planner works — its
+unit tests show it banking transfers and timing a purchase to the week a fixture
+run begins. But across a five-week horizon a player's predicted points vary by
+0.096 on average against 1.325 of spread *between* players, a ratio of 0.07, and
+the mean rank change from week one to week five is 43 places out of 780. The five
+gameweeks are very nearly the same ranking problem repeated, so there is nothing
+to plan around.
+
+The cause is upstream of the optimiser. Form is held constant across the horizon
+by construction, so the only varying inputs are the three next-fixture columns,
+which together carry under a tenth of the model's feature importance. **The
+blocker for multi-week planning is fixture sensitivity in the model, not the
+solver** — which moves "better information" from last place to first on the
+roadmap.
+
 The lesson underneath: lightly-evidenced cheap players are not bad buys, because
-they free budget for premiums. And three changes to the *estimator* moved squad
-quality by nothing, which suggests the estimator is not the binding constraint.
+they free budget for premiums. And four changes to the *estimator or the solver*
+moved squad quality by nothing, against one missing capability (chips) worth more
+than the entire gap to a human.
 
 ## Chips
 
@@ -160,11 +177,12 @@ have already used: `--chips-used TC BB`.
 
 ## Roadmap
 
-1. **Multi-gameweek horizon** — the largest remaining structural gap. The MILP has
-   the right shape and needs a gameweek index on the decision variables plus a
-   transfer-state chain between them. It would also improve chip timing, which
-   currently values a chip only against the coming week.
-2. **Better information** — opponent defensive strength rather than FPL's 1–5
-   difficulty, per-90 rates, set-piece and penalty duty.
+1. **Fixture sensitivity in the model** — opponent defensive strength rather than
+   FPL's coarse 1–5 rating, per-90 rates, home/away splits, set-piece and penalty
+   duty. Promoted to first because it is what blocks everything downstream: until
+   predictions distinguish one gameweek from another, neither multi-week planning
+   nor sharper chip timing has anything to work with.
+2. **Multi-gameweek horizon, revisited** — the machinery exists and is tested
+   (`optimizer.optimize_horizon`). Worth re-measuring once (1) lands, not before.
 3. **Separate chip allocation from season luck** — the eight-chip season is a
    sample of one, so the +254 cannot yet be attributed to the doubled allocation.
