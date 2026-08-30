@@ -10,6 +10,7 @@ import argparse
 
 import pandas as pd
 
+import chips
 import data_fetcher
 import features
 import identity
@@ -183,6 +184,56 @@ def describe_transfers(option_index, squad, current_squad_ids, players, free_tra
     print(f"  Expected gain {total_gain:+.2f}, after hit {total_gain - cost:+.2f} pts")
 
 
+def report_chips(squad_ids, players, gameweek, bootstrap, used=()):
+    """
+    Say whether a chip is worth playing this week, and why.
+
+    The same rule the backtest uses: value each legal chip in expected points and
+    compare against a bar that decays to zero at the end of its window. Chips
+    already used this season are passed in via `used`, since the public API does
+    not report a manager's remaining chips.
+    """
+    if not squad_ids:
+        return
+
+    windows = chips.windows_from_bootstrap(bootstrap)
+    state = chips.ChipState(windows)
+    for code in used:
+        state.mark_played(code, gameweek)
+
+    playable = state.available(gameweek)
+    if not playable:
+        print("\nChips: none available this gameweek.")
+        return
+
+    predictions = dict(zip(players["element_id"], players["predicted_points"]))
+    held = [i for i in squad_ids if i in predictions]
+
+    gains = {
+        "TC": chips.triple_captain_gain(held, predictions),
+        "BB": chips.bench_boost_gain(held, predictions),
+    }
+
+    print(f"\nChips available in GW{gameweek}:")
+    recommended = []
+    for _, code, weeks_left in playable:
+        if code not in gains:
+            # Wildcard and free hit are valued against a full rebuild, which the
+            # weekly run does not solve for; flag them rather than guess.
+            print(f"  {code}: available ({weeks_left} gameweeks left in window) "
+                  f"- run --wildcard to value a rebuild")
+            continue
+        bar = state.threshold(code, gameweek)
+        verdict = "PLAY" if gains[code] >= bar else "hold"
+        if verdict == "PLAY":
+            recommended.append(code)
+        print(f"  {code}: worth {gains[code]:.1f} pts, bar {bar:.1f} "
+              f"({weeks_left} gameweeks left) -> {verdict}")
+
+    if recommended:
+        print(f"  => consider playing {', '.join(recommended)} this week")
+
+
 def print_squad(squad):
     captain = squad[squad["is_captain"]]
     starters = squad[squad["is_starter"]].sort_values("position")
@@ -219,6 +270,9 @@ def main():
                              "the 2025-26 backtest at every threshold tried "
                              "(1934 ungated vs 1865 at 5, 1921 at 10 and 20)")
     parser.add_argument("--wildcard", action="store_true", help="ignore current squad and rebuild")
+    parser.add_argument("--chips-used", nargs="*", default=[], metavar="CODE",
+                        choices=["WC", "FH", "BB", "TC"],
+                        help="chips already played this season (the API does not report them)")
     args = parser.parse_args()
 
     bootstrap = data_fetcher.get_bootstrap_static()
@@ -282,6 +336,7 @@ def main():
             describe_transfers(index, squad, squad_ids, players, args.free_transfers)
         print("\nRecommended squad (option 1):")
         print_squad(squads[0])
+        report_chips(squad_ids, players, current_gw, bootstrap, args.chips_used)
     else:
         squads = optimize_squad(players, free_transfers=15, current_squad_ids=None, budget=budget)
         if not squads:

@@ -10,15 +10,19 @@ pricing every decision at the gameweek it was taken:
 
 | | Season total |
 |---|---:|
-| Human manager (this account's real 2025-26) | **2151** |
-| Model, weekly transfers | 1996 |
+| Model, weekly transfers + chips | **2250** |
+| Human manager (this account's real 2025-26) | 2151 |
+| Model, transfers only, no chips | 1996 |
 | Model squad, never transferred again | 1806 |
 
-Two things to read from that. The transfer engine is worth **+190** over holding
-a fixed squad, so the machinery does something. And the model still **trails a
-competent human by 155 points**, so it is not yet worth following blindly.
+Read it as three separate contributions. Transfers are worth **+190** over holding
+a fixed squad. Chips are worth a further **+254**. Together that puts the model
+**99 points ahead of a competent human** over a full season.
 
-The model plays no chips in that simulation; the human total includes theirs.
+Treat the chip figure with caution. Repeating the exercise on 2024-25, which had
+five chips rather than eight, the same logic gained only **+74** — and +19 at the
+thresholds originally hand-picked. The chip gain is consistently positive but its
+size varies a lot by season and by how patiently the chips are held.
 
 ## Setup
 
@@ -119,9 +123,25 @@ The lesson underneath: lightly-evidenced cheap players are not bad buys, because
 they free budget for premiums. And three changes to the *estimator* moved squad
 quality by nothing, which suggests the estimator is not the binding constraint.
 
+## Chips
+
+Eight chips a season — two each of wildcard, free hit, bench boost and triple
+captain, one of each per half. Windows are read from the live API, since FPL
+doubled the allocation in 2025-26 and hardcoding the old rules silently wastes
+half of them.
+
+Each chip is valued in expected points and compared against a bar that decays to
+zero at the end of its window, so a chip is spent early only on a standout week
+but is never left to expire. Deferring everything to the deadline scores badly
+(+4 on 2025-26): chips collide at the window's final gameweek and only one can be
+played, so the rest are lost.
+
+`main.py` reports which chips are available and whether each clears its bar.
+Because the API does not expose a manager's remaining chips, pass the ones you
+have already used: `--chips-used TC BB`.
+
 ## Known gaps
 
-- **Chips are never played** in the backtest, while the human total includes them.
 - **The horizon is one gameweek.** Serious solvers plan 5–8 with decaying weights.
 - **Budget uses current price, not selling price**, overstating funds on risen
   players. The public API does not expose selling price.
@@ -131,11 +151,11 @@ quality by nothing, which suggests the estimator is not the binding constraint.
 
 ## Roadmap
 
-1. **Chips** — play wildcard, free hit, bench boost and triple captain. Missing
-   functionality rather than a modelling problem; the optimizer already accepts
-   `chip_active`.
-2. **Multi-gameweek horizon** — the largest structural gap. The MILP has the right
-   shape and needs a gameweek index on the decision variables plus a transfer-state
-   chain between them.
-3. **Better information** — opponent defensive strength rather than FPL's 1–5
+1. **Multi-gameweek horizon** — the largest remaining structural gap. The MILP has
+   the right shape and needs a gameweek index on the decision variables plus a
+   transfer-state chain between them. It would also improve chip timing, which
+   currently values a chip only against the coming week.
+2. **Better information** — opponent defensive strength rather than FPL's 1–5
    difficulty, per-90 rates, set-piece and penalty duty.
+3. **Chip thresholds on more seasons** — two is thin evidence for the current
+   values, and the gain varied fourfold between them.

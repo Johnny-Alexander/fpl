@@ -26,6 +26,7 @@ sys.path.insert(0, SCRIPT_DIR)
 
 import pandas as pd
 
+import chips
 import features
 import ml_model
 from optimizer import optimize_squad
@@ -194,9 +195,57 @@ def build_player_frame(codes, pred_map, prices, positions, teams, gw,
     return pd.DataFrame(records)
 
 
+def choose_chip(state, gw, squad, pred_map, frame, budget, free_transfers,
+                max_transfers, baseline_expected):
+    """
+    Decide which chip, if any, to play this gameweek.
+
+    Each candidate is scored by the extra expected points it would bring, then
+    compared against a bar that decays to zero at the end of that chip's window.
+    The best qualifying chip is played; ties go to the larger margin over the bar,
+    so a chip that is merely legal does not crowd out one that is genuinely due.
+    """
+    if not squad:
+        return None, None
+
+    playable = {code for _, code, _ in state.available(gw)}
+    if not playable:
+        return None, None
+
+    candidates = []
+
+    if "TC" in playable:
+        candidates.append(("TC", chips.triple_captain_gain(squad, pred_map), None))
+
+    if "BB" in playable:
+        candidates.append(("BB", chips.bench_boost_gain(squad, pred_map), None))
+
+    # Wildcard and free hit both need an unconstrained rebuild to value, so solve
+    # once and reuse it for whichever of the two is available.
+    if playable & {"WC", "FH"}:
+        rebuild = optimize_squad(frame, free_transfers=15, current_squad_ids=list(squad),
+                                 budget=budget, n=1, chip_active="WC")
+        if rebuild:
+            rebuilt = [int(c) for c in rebuild[0]["element_id"]]
+            gain = chips.expected_from_squad(rebuilt, pred_map) - baseline_expected
+            for code in ("WC", "FH"):
+                if code in playable:
+                    candidates.append((code, gain, rebuilt))
+
+    best = None
+    for code, gain, payload in candidates:
+        margin = gain - state.threshold(code, gw)
+        if margin >= 0 and (best is None or margin > best[1]):
+            best = (code, margin, payload)
+
+    if best is None:
+        return None, None
+    return best[0], best[2]
+
+
 def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
              strategy="model", retrain_every=4, max_transfers=2, verbose=True,
-             min_evidence=0):
+             min_evidence=0, use_chips=False, chip_windows=None, chip_thresholds=None):
     """
     Play a season under one strategy.
 
@@ -219,6 +268,10 @@ def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
     model = None
     transfer_log = []
 
+    chip_state = chips.ChipState(chip_windows, chip_thresholds) if use_chips else None
+    chip_log = []
+    free_hit_squad = None  # squad to restore the gameweek after a free hit
+
     for gw in range(first_gw, last_gw + 1):
         if model is None or (gw - first_gw) % retrain_every == 0:
             fresh = train_for_gameweek(labelled, feature_cols, season_index, gw, kind)
@@ -240,10 +293,16 @@ def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
             ]
             evidence = prior.groupby("code").size().to_dict()
 
+        # A free hit lasts one gameweek; the previous squad returns afterwards.
+        if free_hit_squad is not None:
+            squad = free_hit_squad
+            free_hit_squad = None
+
         frame = build_player_frame(codes, pred_map, prices, positions, teams, gw,
                                    evidence=evidence, min_evidence=min_evidence,
                                    held=squad or ())
 
+        chip = None
         if squad is None:
             # Opening squad: a full rebuild on the starting budget.
             result = optimize_squad(frame, free_transfers=15, current_squad_ids=None,
@@ -259,6 +318,24 @@ def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
                                     hard_max_transfers=max_transfers)
             transfers_made, hit = 0, 0
 
+            if chip_state is not None and result:
+                baseline = chips.expected_from_squad(
+                    [int(c) for c in result[0]["element_id"]], pred_map
+                )
+                chip, _ = choose_chip(chip_state, gw, squad, pred_map, frame, budget,
+                                      free_transfers, max_transfers, baseline)
+                if chip is not None:
+                    chip_state.mark_played(chip, gw)
+                    chip_log.append((gw, chip))
+                    if chip in ("WC", "FH"):
+                        # Unlimited transfers, no hit.
+                        result = optimize_squad(
+                            frame, free_transfers=15, current_squad_ids=list(squad),
+                            budget=budget, n=1, chip_active=chip,
+                        )
+                        if chip == "FH":
+                            free_hit_squad = list(squad)
+
         if not result:
             gw_scores[gw] = 0.0
             continue
@@ -268,7 +345,8 @@ def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
         if squad is not None and strategy != "hold":
             outgoing = set(squad) - set(new_squad)
             transfers_made = len(outgoing)
-            hit = max(0, transfers_made - free_transfers) * 4
+            # Wildcard and free hit make every transfer free.
+            hit = 0 if chip in ("WC", "FH") else max(0, transfers_made - free_transfers) * 4
             if transfers_made:
                 incoming = set(new_squad) - set(squad)
                 transfer_log.append(
@@ -283,20 +361,25 @@ def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
         captains = [int(c) for c in chosen[chosen["is_captain"]]["element_id"]]
         captain = captains[0] if captains else None
 
-        raw = score_gameweek(starters, bench, captain, gw, points, minutes, positions)
+        raw = score_gameweek(starters, bench, captain, gw, points, minutes, positions,
+                             chip=chip)
         gw_scores[gw] = raw - hit
 
         if strategy != "hold":
-            free_transfers = (
-                min(MAX_FREE_TRANSFERS, free_transfers + 1) if transfers_made == 0 else 1
-            )
+            if chip in ("WC", "FH"):
+                free_transfers = 1  # the chip does not consume the weekly transfer
+            else:
+                free_transfers = (
+                    min(MAX_FREE_TRANSFERS, free_transfers + 1) if transfers_made == 0 else 1
+                )
 
         if verbose:
             note = f" {transfers_made}T" if transfers_made else ""
             note += f" (-{hit})" if hit else ""
+            note += f" [{chip}]" if chip else ""
             print(f"    GW{gw:2d}: {gw_scores[gw]:6.1f}{note}")
 
-    return gw_scores, transfer_log
+    return gw_scores, transfer_log, chip_log
 
 
 def pick_xi_only(squad, frame):
@@ -324,6 +407,10 @@ def main():
     parser.add_argument("--model", default=ml_model.DEFAULT_MODEL, choices=ml_model.SELECTABLE)
     parser.add_argument("--retrain-every", type=int, default=4)
     parser.add_argument("--max-transfers", type=int, default=2)
+    parser.add_argument("--no-chips", dest="chips", action="store_false",
+                        help="disable chips; on by default, since the human total "
+                             "being compared against includes theirs")
+    parser.set_defaults(chips=True)
     parser.add_argument("--actual-total", type=int, default=2151,
                         help="manager's real total for the season, for comparison")
     args = parser.parse_args()
@@ -335,20 +422,28 @@ def main():
     labelled, feature_cols, panel = features.prepare(args.train_seasons)
     print(f"  {len(labelled):,} labelled rows, {len(feature_cols)} features")
 
+    strategies = [("model", "Model (weekly transfers)", args.chips),
+                  ("hold", "Hold (no transfers)", False)]
+    if args.chips:
+        strategies.insert(1, ("model", "Model (no chips)", False))
+
     runs = {}
-    for strategy, label in [("model", "Model (weekly transfers)"), ("hold", "Hold (no transfers)")]:
+    for strategy, label, use_chips in strategies:
         print(f"\n  {label}")
-        scores, log = simulate(
+        scores, log, chip_log = simulate(
             panel, labelled, feature_cols, args.season,
             args.first_gw, args.last_gw, args.model,
             strategy=strategy, retrain_every=args.retrain_every,
             max_transfers=args.max_transfers, verbose=False,
+            use_chips=use_chips,
         )
         runs[label] = scores
         total = sum(scores.values())
         print(f"    total {total:.0f} over {len(scores)} gameweeks")
         if strategy == "model":
             print(f"    {len(log)} gameweeks with transfers")
+        if chip_log:
+            print("    chips: " + ", ".join(f"GW{g} {c}" for g, c in chip_log))
 
     print(f"\n{'=' * 60}")
     print("  SUMMARY")

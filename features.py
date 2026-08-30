@@ -92,6 +92,14 @@ def load_season(season):
     """Load one season's gameweek data with stable identity attached."""
     path = f"{identity.season_dir(season)}/gws/merged_gw.csv"
     raw = pd.read_csv(path)
+
+    # 2024-25 introduced Assistant Manager elements, which occupy their own slot
+    # rather than the 15-man squad and have no position in the 2/5/5/3 shape.
+    # They appear only in that season (322 rows) and must not enter the panel:
+    # left in, they carry a null position that propagates into the optimizer.
+    if "position" in raw.columns:
+        raw = raw[raw["position"] != "AM"]
+
     df = identity.attach_identity(raw, season)
     df = _numeric(df, SUM_STATS + LAST_STATS)
     df["GW"] = df["GW"].astype(int)
