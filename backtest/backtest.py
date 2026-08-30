@@ -29,7 +29,7 @@ import pandas as pd
 import chips
 import features
 import ml_model
-from optimizer import optimize_squad
+from optimizer import optimize_horizon, optimize_squad
 from visualize import plot_worm_graph
 
 STARTING_BUDGET = 1000
@@ -165,6 +165,42 @@ def predictions_for_gameweek(panel, feature_cols, model, season, gw):
     return dict(zip(rows["code"].astype(int), predicted))
 
 
+def fixture_context_by_gw(panel, season):
+    """
+    Per-team fixture context for each gameweek of a season, from the panel.
+
+    Fixture lists are published well in advance, so using a future gameweek's
+    difficulty and fixture count at planning time is legitimate. Form is never
+    taken from the future -- only the schedule.
+    """
+    rows = panel[panel["season"] == season]
+    grouped = rows.groupby(["GW", "team_id"]).agg(
+        count=("fixture_count", "max"),
+        difficulty=("match_difficulty", "mean"),
+        home=("was_home", "mean"),
+    )
+    context = {}
+    for (gw, team), row in grouped.iterrows():
+        context.setdefault(int(gw), {})[int(team)] = (
+            float(row["count"]), float(row["difficulty"]), float(row["home"])
+        )
+    return context
+
+
+def horizon_predictions(panel, feature_cols, model, season, gw, horizon, context):
+    """
+    Predicted points for every player across `horizon` gameweeks from `gw`.
+
+    Form is taken from the most recent row before `gw` and held constant; only
+    the fixture context varies week to week.
+    """
+    latest = panel[(panel["season"] == season) & (panel["GW"] == gw - 1)]
+    if latest.empty:
+        return {}
+    wanted = {g: context.get(g, {}) for g in range(gw, gw + horizon)}
+    return features.predict_horizon(model, latest, feature_cols, wanted)
+
+
 def build_player_frame(codes, pred_map, prices, positions, teams, gw,
                        evidence=None, min_evidence=0, held=()):
     """
@@ -245,7 +281,8 @@ def choose_chip(state, gw, squad, pred_map, frame, budget, free_transfers,
 
 def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
              strategy="model", retrain_every=4, max_transfers=2, verbose=True,
-             min_evidence=0, use_chips=False, chip_windows=None, chip_thresholds=None):
+             min_evidence=0, use_chips=False, chip_windows=None, chip_thresholds=None,
+             horizon=1, decay=None):
     """
     Play a season under one strategy.
 
@@ -260,6 +297,7 @@ def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
     # Career gameweeks available to the model at each point in the season, used
     # by the evidence gate. Taken as the count strictly before the gameweek.
     evidence_rows = panel[panel["season_index"] <= season_index]
+    schedule = fixture_context_by_gw(panel, season) if horizon > 1 else {}
 
     squad = None
     bank = 0.0
@@ -313,9 +351,20 @@ def simulate(panel, labelled, feature_cols, season, first_gw, last_gw, kind,
             transfers_made, hit = 0, 0
         else:
             budget = sum(price_at(prices, c, gw) for c in squad) + bank
-            result = optimize_squad(frame, free_transfers=free_transfers,
-                                    current_squad_ids=list(squad), budget=budget, n=1,
-                                    hard_max_transfers=max_transfers)
+            if horizon > 1:
+                points_by_gw = horizon_predictions(
+                    panel, feature_cols, model, season, gw, horizon, schedule
+                )
+                kwargs = {} if decay is None else {"decay": decay}
+                result, _ = optimize_horizon(
+                    frame, points_by_gw, list(squad), budget,
+                    free_transfers=free_transfers, horizon=horizon,
+                    max_transfers_per_gw=max_transfers, **kwargs
+                )
+            else:
+                result = optimize_squad(frame, free_transfers=free_transfers,
+                                        current_squad_ids=list(squad), budget=budget, n=1,
+                                        hard_max_transfers=max_transfers)
             transfers_made, hit = 0, 0
 
             if chip_state is not None and result:
@@ -407,6 +456,8 @@ def main():
     parser.add_argument("--model", default=ml_model.DEFAULT_MODEL, choices=ml_model.SELECTABLE)
     parser.add_argument("--retrain-every", type=int, default=4)
     parser.add_argument("--max-transfers", type=int, default=2)
+    parser.add_argument("--horizon", type=int, default=1,
+                        help="gameweeks to plan over (1 = the original myopic objective)")
     parser.add_argument("--no-chips", dest="chips", action="store_false",
                         help="disable chips; on by default, since the human total "
                              "being compared against includes theirs")
@@ -435,7 +486,7 @@ def main():
             args.first_gw, args.last_gw, args.model,
             strategy=strategy, retrain_every=args.retrain_every,
             max_transfers=args.max_transfers, verbose=False,
-            use_chips=use_chips,
+            use_chips=use_chips, horizon=args.horizon,
         )
         runs[label] = scores
         total = sum(scores.values())

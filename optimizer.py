@@ -14,6 +14,7 @@ SQUAD_SIZE = 15
 STARTERS = 11
 MAX_PER_TEAM = 3
 TRANSFER_COST = 4
+MAX_FREE_TRANSFERS = 5  # FPL banks up to five
 
 # Weight on bench players in the objective. A benched player only scores through
 # an autosub, so they are worth a small fraction of their expected points -- enough
@@ -137,6 +138,225 @@ def optimize_squad(
             prob += pulp.lpSum(squad[i] for i in chosen) <= SQUAD_SIZE - 1
 
     return squads
+
+
+DEFAULT_HORIZON = 5
+DEFAULT_DECAY = 0.85  # weight on gameweek t is DECAY**t
+DEFAULT_POOL = 220    # players considered, on top of whatever is already held
+
+# A free transfer is not free: keeping it banked buys flexibility to react to
+# next week's injury news. Without a small charge the solver is indifferent
+# between holding and making a zero-gain swap, and churns the squad for nothing.
+# Set far below any real difference in predicted points, so it only breaks ties.
+IDLE_TRANSFER_PENALTY = 0.05
+
+
+def _prune_pool(players, points_by_gw, held, pool_size):
+    """
+    Keep the strongest candidates plus everything currently held.
+
+    A horizon of five gameweeks over six hundred players is tens of thousands of
+    binaries, which CBC will not solve in reasonable time. Ranking by a player's
+    best gameweek in the horizon keeps anyone with a standout fixture, which is
+    precisely who a multi-week plan is looking for -- ranking by the mean would
+    discard a player with one huge week.
+    """
+    best = {}
+    for per_player in points_by_gw.values():
+        for code, value in per_player.items():
+            if value > best.get(code, float("-inf")):
+                best[code] = value
+
+    ranked = sorted(best, key=lambda c: -best[c])[:pool_size]
+    keep = set(ranked) | set(held)
+    return players[players["element_id"].isin(keep)].copy()
+
+
+def optimize_horizon(
+    player_data,
+    points_by_gw,
+    current_squad_ids,
+    budget,
+    free_transfers=1,
+    horizon=DEFAULT_HORIZON,
+    decay=DEFAULT_DECAY,
+    max_transfers_per_gw=3,
+    pool_size=DEFAULT_POOL,
+    time_limit=60,
+):
+    """
+    Plan transfers over several gameweeks at once.
+
+    The single-gameweek objective is myopic: it cannot buy into a fixture run,
+    bank a transfer toward a double gameweek, or accept a weaker week now for a
+    stronger one later. Here squad membership is indexed by gameweek and linked by
+    a transfer chain, so the solver commits to a plan rather than a move.
+
+    Later gameweeks are discounted by `decay` per week, both because predictions
+    degrade with distance and because a plan will be re-solved next week anyway --
+    only the first move is actually played.
+
+    MEASURED, AND NOT WORTH USING YET. Replicated over four seasons with chips
+    off, against the single-gameweek objective:
+
+        horizon 3:  -41, -45, -110, +77   mean -30, better in 1 of 4 seasons
+        horizon 5:  +17, -65,  +56, +83   mean +23, better in 3 of 4 (p~0.53)
+
+    The mechanism is sound -- the unit tests show it banking transfers and timing
+    a purchase to the week a fixture run starts -- but there is nothing for it to
+    plan around. Across a five-week horizon a player's predicted points vary by
+    0.096 on average, against 1.325 of spread between players: a ratio of 0.07.
+    The mean rank change from week one to week five is 43 places out of 780.
+
+    The cause is upstream. Form features are held constant across the horizon by
+    construction, so the only inputs that vary are next_difficulty,
+    next_fixture_count and next_was_home, which together carry under a tenth of
+    the model's feature importance. Five near-identical rankings make the planner
+    an expensive way to solve the same week five times.
+
+    Making this pay needs a more fixture-sensitive model -- opponent defensive
+    strength rather than FPL's coarse 1-5 rating, per-90 rates, home/away splits
+    -- not a better optimiser. Revisit once predictions actually distinguish one
+    gameweek from another.
+
+    points_by_gw: {gameweek: {element_id: predicted_points}}, in play order.
+    Returns (first_gameweek_squad, plan) where plan lists the transfers per week.
+    """
+    gameweeks = sorted(points_by_gw)[:horizon]
+    if not gameweeks:
+        return [], []
+
+    players = player_data[player_data["position"].isin(POSITION_QUOTA)].copy()
+    players = players.drop_duplicates(subset=["element_id"]).reset_index(drop=True)
+    held = set(current_squad_ids or [])
+    players = _prune_pool(players, points_by_gw, held, pool_size)
+    if players.empty:
+        return [], []
+
+    ids = list(players["element_id"])
+    values = dict(zip(players["element_id"], players["value"]))
+    positions = dict(zip(players["element_id"], players["position"]))
+    teams = dict(zip(players["element_id"], players["team"]))
+
+    by_position = {p: [i for i in ids if positions[i] == p] for p in POSITION_QUOTA}
+    by_team = {}
+    for i in ids:
+        by_team.setdefault(teams[i], []).append(i)
+
+    def points(i, gw):
+        return points_by_gw.get(gw, {}).get(i, 0.0)
+
+    prob = pulp.LpProblem("FPL_Horizon", pulp.LpMaximize)
+    squad = pulp.LpVariable.dicts("squad", (ids, gameweeks), cat="Binary")
+    start = pulp.LpVariable.dicts("start", (ids, gameweeks), cat="Binary")
+    captain = pulp.LpVariable.dicts("captain", (ids, gameweeks), cat="Binary")
+
+    # Transfers out are driven up by the chain constraint and down by the hit
+    # penalty, so they settle at max(0, was_in - is_in) without needing to be
+    # binary -- which keeps the problem tractable.
+    sold = pulp.LpVariable.dicts("sold", (ids, gameweeks), lowBound=0, upBound=1)
+    hits = pulp.LpVariable.dicts("hits", gameweeks, lowBound=0)
+    # Free transfers carried into the *next* gameweek, and the unused count it is
+    # derived from. `spare` is max(0, available - made), which needs the indicator
+    # below: writing banked <= available - made + 1 directly makes the problem
+    # infeasible whenever a hit is taken, silently forbidding a legal move.
+    banked = pulp.LpVariable.dicts("banked", gameweeks, lowBound=0,
+                                   upBound=MAX_FREE_TRANSFERS)
+    spare = pulp.LpVariable.dicts("spare", gameweeks, lowBound=0,
+                                  upBound=MAX_FREE_TRANSFERS)
+    overspent = pulp.LpVariable.dicts("overspent", gameweeks, cat="Binary")
+
+    objective = []
+    for index, gw in enumerate(gameweeks):
+        weight = decay ** index
+
+        objective.append(
+            weight * pulp.lpSum(points(i, gw) * start[i][gw] for i in ids)
+            + weight * pulp.lpSum(points(i, gw) * captain[i][gw] for i in ids)
+            + weight * BENCH_WEIGHT * pulp.lpSum(
+                points(i, gw) * (squad[i][gw] - start[i][gw]) for i in ids
+            )
+            - weight * TRANSFER_COST * hits[gw]
+            - IDLE_TRANSFER_PENALTY * pulp.lpSum(sold[i][gw] for i in ids)
+        )
+
+        prob += pulp.lpSum(squad[i][gw] for i in ids) == SQUAD_SIZE
+        for position, quota in POSITION_QUOTA.items():
+            prob += pulp.lpSum(squad[i][gw] for i in by_position[position]) == quota
+
+        prob += pulp.lpSum(start[i][gw] for i in ids) == STARTERS
+        prob += pulp.lpSum(captain[i][gw] for i in ids) == 1
+        prob += pulp.lpSum(start[i][gw] for i in by_position[1]) == 1
+        for position, minimum in FORMATION_MIN.items():
+            prob += pulp.lpSum(start[i][gw] for i in by_position[position]) >= minimum
+
+        for i in ids:
+            prob += start[i][gw] <= squad[i][gw]
+            prob += captain[i][gw] <= start[i][gw]
+
+        for team_ids in by_team.values():
+            prob += pulp.lpSum(squad[i][gw] for i in team_ids) <= MAX_PER_TEAM
+
+        # Prices are held constant across the horizon: future price changes are
+        # not forecastable, and pretending otherwise would let the plan spend
+        # money it has not earned.
+        prob += pulp.lpSum(values[i] * squad[i][gw] for i in ids) <= budget
+
+    # ── Transfer chain ──
+    for index, gw in enumerate(gameweeks):
+        previous = gameweeks[index - 1] if index else None
+        for i in ids:
+            was_in = squad[i][previous] if previous else (1 if i in held else 0)
+            prob += sold[i][gw] >= was_in - squad[i][gw]
+
+        made = pulp.lpSum(sold[i][gw] for i in ids)
+        prob += made <= max_transfers_per_gw
+
+        available = banked[previous] if previous else free_transfers
+        prob += hits[gw] >= made - available
+
+        # spare = max(0, available - made), exactly.
+        big_m = MAX_FREE_TRANSFERS + max_transfers_per_gw
+        prob += spare[gw] >= available - made
+        prob += spare[gw] <= available - made + big_m * overspent[gw]
+        prob += spare[gw] <= big_m * (1 - overspent[gw])
+
+        # One free transfer is granted each week, and the bank is capped.
+        prob += banked[gw] <= spare[gw] + 1
+        prob += banked[gw] <= MAX_FREE_TRANSFERS
+
+    prob += pulp.lpSum(objective)
+    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit))
+
+    if prob.status not in (pulp.LpStatusOptimal,):
+        return [], []
+
+    def chosen(gw):
+        return [i for i in ids if squad[i][gw].value() and squad[i][gw].value() > 0.5]
+
+    first = gameweeks[0]
+    picked = players[players["element_id"].isin(chosen(first))].copy()
+    picked["is_starter"] = picked["element_id"].map(
+        lambda i: bool(start[i][first].value() and start[i][first].value() > 0.5)
+    )
+    picked["is_captain"] = picked["element_id"].map(
+        lambda i: bool(captain[i][first].value() and captain[i][first].value() > 0.5)
+    )
+
+    plan, previous_squad = [], held
+    for gw in gameweeks:
+        current = set(chosen(gw))
+        plan.append(
+            {
+                "gameweek": gw,
+                "out": sorted(previous_squad - current),
+                "in": sorted(current - previous_squad),
+                "hits": round(hits[gw].value() or 0.0),
+            }
+        )
+        previous_squad = current
+
+    return [picked], plan
 
 
 if __name__ == "__main__":

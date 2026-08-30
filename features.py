@@ -526,6 +526,52 @@ def upcoming_fixture_context(fixtures, gameweek):
     }
 
 
+def apply_fixture_context(rows, context):
+    """
+    Set the next-gameweek fixture columns from a {team_id: (count, difficulty,
+    home_share)} mapping. A team absent from the mapping has a blank gameweek.
+    """
+    out = rows.copy()
+    counts, difficulties, homes = [], [], []
+    for team in out["team_id"]:
+        count, difficulty, home = context.get(int(team), (0, 0.0, 0.0))
+        counts.append(count)
+        difficulties.append(difficulty)
+        homes.append(home)
+    out["next_fixture_count"] = counts
+    out["next_difficulty"] = difficulties
+    out["next_was_home"] = homes
+    return out
+
+
+def predict_horizon(model, latest, feature_cols, context_by_gw):
+    """
+    Predicted points for every player in every gameweek of a horizon.
+
+    Form features are held at their current values and only the fixture context
+    varies, so differences across the horizon come from fixtures alone. Form does
+    drift, but it is not forecastable several weeks out, and fixtures are exactly
+    what a multi-gameweek plan exists to exploit -- buying into a good run, or
+    avoiding a blank.
+
+    Returns {gameweek: {code: predicted_points}}.
+    """
+    usable = latest.dropna(subset=[c for c in feature_cols
+                                   if c not in ("next_fixture_count",
+                                                "next_difficulty",
+                                                "next_was_home")])
+    predictions = {}
+    for gameweek, context in sorted(context_by_gw.items()):
+        block = apply_fixture_context(usable, context)
+        block = block.dropna(subset=feature_cols)
+        if block.empty:
+            predictions[gameweek] = {}
+            continue
+        values = model.predict(block[feature_cols])
+        predictions[gameweek] = dict(zip(block["code"].astype(int), values))
+    return predictions
+
+
 def apply_upcoming_fixtures(latest, fixtures, gameweek):
     """
     Fill the next-gameweek fixture features for prediction rows.
