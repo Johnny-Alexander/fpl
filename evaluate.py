@@ -149,7 +149,7 @@ def main():
     parser.add_argument("--first-gw", type=int, default=12)
     parser.add_argument("--last-gw", type=int, default=38)
     parser.add_argument("--step", type=int, default=2, help="evaluate every Nth gameweek")
-    parser.add_argument("--model", default=ml_model.DEFAULT_MODEL, choices=sorted(ml_model.MODELS))
+    parser.add_argument("--model", default=ml_model.DEFAULT_MODEL, choices=ml_model.SELECTABLE)
     parser.add_argument("--no-shrink", action="store_true",
                         help="disable form shrinkage (for A/B comparison)")
     parser.add_argument("--k-career", type=float, default=features.DEFAULT_K_CAREER)

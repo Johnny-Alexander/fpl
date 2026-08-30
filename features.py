@@ -384,10 +384,13 @@ def add_features(panel, shrink=DEFAULT_SHRINK, k_position=DEFAULT_K_POSITION,
     df = panel.copy()
     by_code = df.groupby("code", sort=False)
 
-    # Target: points in the next gameweek, within the same season.
+    # Target: points in the next gameweek, within the same season. Minutes are
+    # carried alongside so a model can separate "will they play" from "how much
+    # will they score if they do".
     df["target_points"] = by_code["total_points"].shift(-1)
+    df["target_minutes"] = by_code["minutes"].shift(-1)
     next_season = by_code["season_index"].shift(-1)
-    df.loc[next_season != df["season_index"], "target_points"] = np.nan
+    df.loc[next_season != df["season_index"], ["target_points", "target_minutes"]] = np.nan
 
     # Next-gameweek fixture context. All of this is published in advance, so it
     # is legitimately known at prediction time.

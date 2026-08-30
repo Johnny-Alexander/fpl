@@ -210,7 +210,7 @@ def main():
     parser.add_argument("--free-transfers", type=int, default=1)
     parser.add_argument("--max-transfers", type=int, default=3)
     parser.add_argument("--options", type=int, default=3)
-    parser.add_argument("--model", default=ml_model.DEFAULT_MODEL, choices=sorted(ml_model.MODELS))
+    parser.add_argument("--model", default=ml_model.DEFAULT_MODEL, choices=ml_model.SELECTABLE)
     parser.add_argument("--min-chance", type=int, default=75,
                         help="exclude doubtful players below this %% chance of playing")
     parser.add_argument("--min-evidence", type=int, default=0,

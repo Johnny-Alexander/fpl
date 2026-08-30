@@ -70,6 +70,7 @@ obviously wrong. Three fixes were built and measured, and none of them helped.
 | Hierarchical shrinkage of form toward career, then positional, means | No effect. Top-15 per gameweek, paired over 35 folds: 4.676 → 4.703, better in 16/35, p=0.86, 95% CI [−0.27, +0.32]. MAE ~1% worse in every evidence segment. |
 | `log_career_gws` as a model feature | −62 points over the 2025-26 backtest (1996 → 1934). |
 | Minimum-evidence gate on transfers in | Worse at every threshold: 1934 ungated, 1865 at 5, 1921 at 10 and 20. |
+| Two-stage model, P(60+ mins) × E[points \| played] | Marginally better at prediction (starters MAE 2.225 vs 2.238, rank ρ 0.363 vs 0.354) but no better at picking squads: top-15 per gameweek paired over 29 folds 4.623 vs 4.577, p=0.76; backtest 1955 vs 1996. Kept as `--model two-stage` for its calibrated start probability. |
 
 Both the shrinkage and the gate remain available behind flags
 (`features.DEFAULT_SHRINK`, `--min-evidence`) and are off by default.
