@@ -33,6 +33,24 @@ DEFAULT_WINDOWS = [
     ("3xc", 1, 19), ("3xc", 20, 38),
 ]
 
+# Before 2025-26: two wildcards split by half, and a single free hit, bench boost
+# and triple captain each playable in any gameweek. Backtesting an older season
+# with the current allocation would hand it three chips it never had.
+LEGACY_WINDOWS = [
+    ("wildcard", 2, 19), ("wildcard", 20, 38),
+    ("freehit", 1, 38),
+    ("bboost", 1, 38),
+    ("3xc", 1, 38),
+]
+
+# The season the allocation doubled.
+DOUBLED_FROM = "2025-26"
+
+
+def windows_for_season(season):
+    """Chip allocation in force for a given season label, e.g. '2023-24'."""
+    return DEFAULT_WINDOWS if season >= DOUBLED_FROM else LEGACY_WINDOWS
+
 # Minimum expected gain, in points, to spend a chip at the *start* of its window.
 # Each decays linearly to zero at the window's final gameweek.
 #

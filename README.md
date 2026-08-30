@@ -5,24 +5,31 @@ every player, then solving for the best legal squad as a mixed-integer program.
 
 ## Where it currently stands
 
-Replaying the whole of 2025-26 gameweek by gameweek, retraining as it goes and
-pricing every decision at the gameweek it was taken:
+Four seasons replayed gameweek by gameweek, each trained only on the season
+before it, retraining as it goes and pricing every decision at the gameweek it
+was taken (`backtest/validate.py`):
 
-| | Season total |
-|---|---:|
-| Model, weekly transfers + chips | **2250** |
-| Human manager (this account's real 2025-26) | 2151 |
-| Model, transfers only, no chips | 1996 |
-| Model squad, never transferred again | 1806 |
+| Season | Hold | Transfers | + chips | Transfer Δ | Chip Δ |
+|---|---:|---:|---:|---:|---:|
+| 2022-23 | 1742 | 1995 | 2112 | +253 | +117 |
+| 2023-24 | 1532 | 1983 | 2075 | +451 | +92 |
+| 2024-25 | 1899 | 1956 | 2030 | +57 | +74 |
+| 2025-26 | 1806 | 1996 | **2250** | +190 | +254 |
 
-Read it as three separate contributions. Transfers are worth **+190** over holding
-a fixed squad. Chips are worth a further **+254**. Together that puts the model
-**99 points ahead of a competent human** over a full season.
+**Both effects replicate: transfers and chips are positive in all four seasons.**
+Transfers average **+238** over holding a fixed squad (range +57 to +451), chips a
+further **+134** (range +74 to +254). Neither is a single-season fluke.
 
-Treat the chip figure with caution. Repeating the exercise on 2024-25, which had
-five chips rather than eight, the same logic gained only **+74** — and +19 at the
-thresholds originally hand-picked. The chip gain is consistently positive but its
-size varies a lot by season and by how patiently the chips are held.
+The most encouraging number is the stability of the transfers-only column: 1995,
+1983, 1956, 1996 across four seasons — a spread of 40 points. The `hold` baseline
+swings by 367 because it depends entirely on which opening squad it happened to
+draw, and the transfer engine corrects for that. 2024-25's small +57 is not a bad
+year for the model; it is a year when the opening squad was already good.
+
+Two caveats. Chip value is confounded with the allocation: the three five-chip
+seasons average +94, and the one eight-chip season gave +254, which cannot be
+separated from season luck at n=1. And the comparison against a human rests on a
+single figure — this account scored 2151 in 2025-26, against the model's 2250.
 
 ## Setup
 
@@ -54,6 +61,7 @@ python3 main.py --free-transfers 2       # if you have banked transfers
 
 python3 evaluate.py                      # walk-forward evaluation vs naive baselines
 python3 backtest/backtest.py             # full-season simulation + worm graph
+python3 backtest/validate.py             # replicate across four seasons
 ```
 
 Your team id is in the URL when you are logged in:
@@ -70,7 +78,8 @@ Your team id is in the URL when you are logged in:
 | `evaluate.py` | walk-forward evaluation against naive baselines |
 | `optimizer.py` | squad selection MILP |
 | `main.py` | weekly recommendation CLI |
-| `backtest/` | full-season simulation and worm graph |
+| `chips.py` | chip allocation, valuation and timing |
+| `backtest/` | full-season simulation, multi-season replication, worm graph |
 | `setup_data.sh` | fetches the historical dataset |
 
 Data flows one way: raw gameweek CSVs → dense player-gameweek panel keyed on
@@ -157,5 +166,5 @@ have already used: `--chips-used TC BB`.
    currently values a chip only against the coming week.
 2. **Better information** — opponent defensive strength rather than FPL's 1–5
    difficulty, per-90 rates, set-piece and penalty duty.
-3. **Chip thresholds on more seasons** — two is thin evidence for the current
-   values, and the gain varied fourfold between them.
+3. **Separate chip allocation from season luck** — the eight-chip season is a
+   sample of one, so the +254 cannot yet be attributed to the doubled allocation.
