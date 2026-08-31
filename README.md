@@ -123,6 +123,7 @@ obviously wrong, and fixing it did not help.
 | `log_career_gws` as a model feature | −62 points over the 2025-26 backtest (1996 → 1934). |
 | Minimum-evidence gate on transfers in | Worse at every threshold: 1934 ungated, 1865 at 5, 1921 at 10 and 20. |
 | Multi-gameweek horizon (plan 3–8 weeks, transfer chain, banked free transfers) | Horizon 3 mean −30, better in 1 of 4 seasons; horizon 5 mean +23, better in 3 of 4 but p≈0.53. Diagnosis below. Available as `--horizon N` in the backtest, default 1. |
+| Richer opponent features (attack/defence strength by venue, rolling goals scored and conceded) | No help on either question. Weekly: top-15 paired over 29 folds 4.455 vs 4.577, p=0.27; starters MAE 2.238 → 2.242. Horizon: cross-week variation ratio 0.07 → 0.116, still far short of what planning needs. Behind `features.USE_OPPONENT_FEATURES`. |
 | Two-stage model, P(60+ mins) × E[points \| played] | Marginally better at prediction (starters MAE 2.225 vs 2.238, rank ρ 0.363 vs 0.354) but no better at picking squads: top-15 paired over 29 folds 4.623 vs 4.577, p=0.76; backtest 1955 vs 1996. Kept as `--model two-stage` for its calibrated start probability. |
 
 Shrinkage, the evidence gate and the two-stage model all remain available behind
@@ -177,12 +178,18 @@ have already used: `--chips-used TC BB`.
 
 ## Roadmap
 
-1. **Fixture sensitivity in the model** — opponent defensive strength rather than
-   FPL's coarse 1–5 rating, per-90 rates, home/away splits, set-piece and penalty
-   duty. Promoted to first because it is what blocks everything downstream: until
-   predictions distinguish one gameweek from another, neither multi-week planning
-   nor sharper chip timing has anything to work with.
-2. **Multi-gameweek horizon, revisited** — the machinery exists and is tested
-   (`optimizer.optimize_horizon`). Worth re-measuring once (1) lands, not before.
+Performance work looks finished. Six attempts to improve the model or the solver
+have now returned nothing, against one missing capability (chips) worth more than
+the entire gap to a human. Fixture detail was the last mechanism with a clear
+story behind it, and richer opponent data moved neither the weekly pick nor the
+cross-week variation that multi-week planning needs. What remains is correctness
+and delivery:
+
+1. **Bounded correctness fixes** — selling price (budget currently overstates
+   funds on risen players), the vice-captain (not modelled at all), and
+   `--free-transfers` defaulting to 1 when you may have banked up to 5.
+2. **Make it get used** — a scheduled weekly job that posts the recommendation,
+   rather than something to remember to run.
 3. **Separate chip allocation from season luck** — the eight-chip season is a
    sample of one, so the +254 cannot yet be attributed to the doubled allocation.
+   Next season's data settles it at no cost.

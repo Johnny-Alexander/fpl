@@ -88,6 +88,124 @@ def _numeric(df, cols):
     return df
 
 
+# Opponent-derived columns, attached per fixture and averaged across a double.
+OPPONENT_STATS = [
+    "opp_attack",
+    "opp_defence",
+    "opp_overall",
+    "opp_conceded_r5",
+    "opp_scored_r5",
+]
+
+# Computed always -- they are cheap and the horizon machinery needs the plumbing
+# -- but kept out of the model by default, because they were measured and did not
+# help on either question they were built to answer.
+#
+# Weekly prediction: top-15 realised per gameweek, paired over 29 folds, 4.577
+# without against 4.455 with, better in 15/29, p=0.27. Starters MAE 2.238 -> 2.242
+# and rank correlation 0.354 -> 0.350, both marginally worse.
+#
+# Multi-week planning: the point of these features was to make a player's
+# prediction differ between gameweeks so a horizon has something to plan around.
+# The within-player/across-player variation ratio rose from 0.07 to 0.116 and the
+# mean rank movement from week one to week five went from 43 to 46 places out of
+# ~780. Better, but nowhere near enough -- the weeks are still near-identical
+# ranking problems.
+#
+# Fixture information sits at a tenth of total feature importance either way. The
+# limit looks like how much fixtures matter to next-gameweek FPL points at all,
+# not how finely they are described.
+USE_OPPONENT_FEATURES = False
+
+
+def team_match_results(raw, team_lookup):
+    """
+    Goals scored and conceded by each team in each gameweek.
+
+    Taken from the match scores on any one of a team's player rows rather than by
+    summing player stats, which would double-count across a squad.
+    """
+    per_fixture = raw.drop_duplicates(subset=["team_id", "GW", "fixture"]).copy()
+    home = per_fixture["was_home"].astype(bool)
+    per_fixture["scored"] = np.where(
+        home, per_fixture["team_h_score"], per_fixture["team_a_score"]
+    )
+    per_fixture["conceded"] = np.where(
+        home, per_fixture["team_a_score"], per_fixture["team_h_score"]
+    )
+    per_fixture[["scored", "conceded"]] = per_fixture[["scored", "conceded"]].fillna(0.0)
+
+    return (
+        per_fixture.groupby(["team_id", "GW"], as_index=False)[["scored", "conceded"]]
+        .sum()
+        .sort_values(["team_id", "GW"])
+    )
+
+
+def team_form(raw):
+    """
+    Each team's recent scoring and conceding rate, as it stood *before* each
+    gameweek.
+
+    The rolling mean is shifted by one so a team's form entering a match never
+    includes the result of that match.
+    """
+    results = team_match_results(raw, None)
+    grouped = results.groupby("team_id")
+    for column in ("scored", "conceded"):
+        rolled = grouped[column].transform(lambda s: s.rolling(5, min_periods=1).mean())
+        results[f"{column}_r5"] = grouped[column].transform(
+            lambda s: s.rolling(5, min_periods=1).mean().shift(1)
+        )
+    league_mean = results[["scored_r5", "conceded_r5"]].mean()
+    results[["scored_r5", "conceded_r5"]] = results[["scored_r5", "conceded_r5"]].fillna(
+        league_mean
+    )
+    return results[["team_id", "GW", "scored_r5", "conceded_r5"]]
+
+
+def attach_opponent(df, season):
+    """
+    Describe the opponent each row is facing.
+
+    FPL's own 1-5 difficulty rating is a single coarse number for every player in
+    a squad. It cannot express that a defender's clean-sheet chance turns on the
+    opponent's *attack* while a forward's return turns on their *defence*, so both
+    sides of the opponent's rating are attached separately, taken from the venue
+    the opponent is playing at. Alongside them go the opponent's recent scoring
+    and conceding rates, which move during a season as the static ratings do not.
+    """
+    teams = identity.season_teams(season).set_index("id")
+
+    def rating(column, fallback):
+        return teams[column] if column in teams.columns else pd.Series(fallback, index=teams.index)
+
+    # The opponent is at home exactly when the player's team is away.
+    opponent_home = ~df["was_home"].astype(bool)
+
+    attack_home = df["opponent_team"].map(rating("strength_attack_home", 1100))
+    attack_away = df["opponent_team"].map(rating("strength_attack_away", 1100))
+    defence_home = df["opponent_team"].map(rating("strength_defence_home", 1100))
+    defence_away = df["opponent_team"].map(rating("strength_defence_away", 1100))
+    overall_home = df["opponent_team"].map(rating("strength_overall_home", 1100))
+    overall_away = df["opponent_team"].map(rating("strength_overall_away", 1100))
+
+    df["opp_attack"] = np.where(opponent_home, attack_home, attack_away)
+    df["opp_defence"] = np.where(opponent_home, defence_home, defence_away)
+    df["opp_overall"] = np.where(opponent_home, overall_home, overall_away)
+
+    form = team_form(df).rename(
+        columns={"team_id": "opponent_team", "scored_r5": "opp_scored_r5",
+                 "conceded_r5": "opp_conceded_r5"}
+    )
+    df = df.merge(form, on=["opponent_team", "GW"], how="left")
+
+    for column in OPPONENT_STATS:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+        df[column] = df[column].fillna(df[column].mean())
+    return df
+
+
 def load_season(season):
     """Load one season's gameweek data with stable identity attached."""
     path = f"{identity.season_dir(season)}/gws/merged_gw.csv"
@@ -109,8 +227,10 @@ def load_season(season):
     else:
         df["was_home"] = False
 
-    # Fixture difficulty from that season's fixture list.
+    # Fixture difficulty from that season's fixture list, then a fuller picture
+    # of the opponent than FPL's single 1-5 rating provides.
     df = _attach_fixture_difficulty(df, season)
+    df = attach_opponent(df, season)
     return df
 
 
@@ -146,6 +266,8 @@ def collapse_doubles(df):
     agg["element"] = "first"
     agg["was_home"] = "mean"
     agg["match_difficulty"] = "mean"
+    for stat in OPPONENT_STATS:
+        agg[stat] = "mean"
 
     out = df.groupby(keys, as_index=False).agg(agg)
     out["fixture_count"] = (
@@ -184,6 +306,10 @@ def expand_blanks(df):
 
         merged["was_home"] = merged["was_home"].fillna(0.0)
         merged["match_difficulty"] = merged["match_difficulty"].fillna(0.0)
+        # A blank has no opponent; zeroed so the model reads it as "no fixture"
+        # consistently with next_fixture_count being zero.
+        for stat in OPPONENT_STATS:
+            merged[stat] = merged[stat].fillna(0.0)
         frames.append(merged)
 
     return pd.concat(frames, ignore_index=True)
@@ -405,7 +531,11 @@ def add_features(panel, shrink=DEFAULT_SHRINK, k_position=DEFAULT_K_POSITION,
     df["next_difficulty"] = by_code["match_difficulty"].shift(-1)
     df["next_fixture_count"] = by_code["fixture_count"].shift(-1)
     df["next_was_home"] = by_code["was_home"].shift(-1)
-    df.loc[next_season != df["season_index"], ["next_difficulty", "next_fixture_count", "next_was_home"]] = np.nan
+    for stat in OPPONENT_STATS:
+        df[f"next_{stat}"] = by_code[stat].shift(-1)
+    crossed = next_season != df["season_index"]
+    df.loc[crossed, ["next_difficulty", "next_fixture_count", "next_was_home"]] = np.nan
+    df.loc[crossed, [f"next_{s}" for s in OPPONENT_STATS]] = np.nan
 
     # How much evidence exists for this player, counted across seasons. Used both
     # as a feature and as the weight in the shrinkage below.
@@ -464,6 +594,8 @@ def feature_columns():
         "next_fixture_count",
         "next_was_home",
     ]
+    if USE_OPPONENT_FEATURES:
+        cols += [f"next_{stat}" for stat in OPPONENT_STATS]
     return cols
 
 
@@ -491,56 +623,31 @@ def latest_rows(panel, season):
     return season_rows.sort_values(["code", "GW"]).drop_duplicates("code", keep="last").copy()
 
 
-def upcoming_fixture_context(fixtures, gameweek):
-    """
-    Per-team fixture context for an upcoming gameweek, from the live fixture list.
+# Every column describing the gameweek being predicted. These are the only inputs
+# that may legitimately differ between one horizon week and the next.
+NEXT_COLUMNS = ["next_fixture_count", "next_difficulty", "next_was_home"] + [
+    f"next_{stat}" for stat in OPPONENT_STATS
+]
 
-    Returns team_id -> (count, mean difficulty, home share). A team absent from
-    the result has a blank gameweek. Counting fixtures rather than overwriting
-    per team matters for doubles, which the previous version collapsed to
-    whichever fixture happened to be last in the list.
-    """
-    context = {}
-    for fixture in fixtures:
-        if fixture.get("event") != gameweek:
-            continue
-        for team_key, difficulty_key, is_home in (
-            ("team_h", "team_h_difficulty", True),
-            ("team_a", "team_a_difficulty", False),
-        ):
-            team = fixture.get(team_key)
-            if team is None:
-                continue
-            entry = context.setdefault(int(team), {"n": 0, "difficulty": [], "home": []})
-            entry["n"] += 1
-            entry["difficulty"].append(fixture.get(difficulty_key) or 3)
-            entry["home"].append(1.0 if is_home else 0.0)
-
-    return {
-        team: (
-            entry["n"],
-            float(np.mean(entry["difficulty"])),
-            float(np.mean(entry["home"])),
-        )
-        for team, entry in context.items()
-    }
+# What a blank gameweek looks like: no fixture, and no opponent to describe.
+BLANK_CONTEXT = {column: 0.0 for column in NEXT_COLUMNS}
 
 
 def apply_fixture_context(rows, context):
     """
-    Set the next-gameweek fixture columns from a {team_id: (count, difficulty,
-    home_share)} mapping. A team absent from the mapping has a blank gameweek.
+    Set the next-gameweek columns from a {team_id: {column: value}} mapping.
+
+    A team absent from the mapping is blank that gameweek and gets zeros, which
+    matches how blanks are encoded when the panel is built.
     """
     out = rows.copy()
-    counts, difficulties, homes = [], [], []
+    columns = {column: [] for column in NEXT_COLUMNS}
     for team in out["team_id"]:
-        count, difficulty, home = context.get(int(team), (0, 0.0, 0.0))
-        counts.append(count)
-        difficulties.append(difficulty)
-        homes.append(home)
-    out["next_fixture_count"] = counts
-    out["next_difficulty"] = difficulties
-    out["next_was_home"] = homes
+        entry = context.get(int(team), BLANK_CONTEXT)
+        for column in NEXT_COLUMNS:
+            columns[column].append(entry.get(column, 0.0))
+    for column, values in columns.items():
+        out[column] = values
     return out
 
 
@@ -556,10 +663,7 @@ def predict_horizon(model, latest, feature_cols, context_by_gw):
 
     Returns {gameweek: {code: predicted_points}}.
     """
-    usable = latest.dropna(subset=[c for c in feature_cols
-                                   if c not in ("next_fixture_count",
-                                                "next_difficulty",
-                                                "next_was_home")])
+    usable = latest.dropna(subset=[c for c in feature_cols if c not in NEXT_COLUMNS])
     predictions = {}
     for gameweek, context in sorted(context_by_gw.items()):
         block = apply_fixture_context(usable, context)
@@ -572,9 +676,64 @@ def predict_horizon(model, latest, feature_cols, context_by_gw):
     return predictions
 
 
-def apply_upcoming_fixtures(latest, fixtures, gameweek):
+def upcoming_fixture_context(fixtures, gameweek, season=None):
     """
-    Fill the next-gameweek fixture features for prediction rows.
+    Per-team context for an upcoming gameweek, from the live fixture list.
+
+    Returns {team_id: {column: value}} covering every next-gameweek column the
+    model consumes, so a team absent from the result is simply blank. Fixtures are
+    counted rather than overwritten, which matters for doubles; ratings and
+    difficulty are averaged across them.
+    """
+    teams = identity.season_teams(season).set_index("id") if season else None
+
+    def rating(team, column, fallback=1100.0):
+        if teams is None or column not in teams.columns or team not in teams.index:
+            return fallback
+        return float(teams.at[team, column])
+
+    gathered = {}
+    for fixture in fixtures:
+        if fixture.get("event") != gameweek:
+            continue
+        home, away = fixture.get("team_h"), fixture.get("team_a")
+        if home is None or away is None:
+            continue
+        for team, opponent, is_home, difficulty_key in (
+            (home, away, True, "team_h_difficulty"),
+            (away, home, False, "team_a_difficulty"),
+        ):
+            entry = gathered.setdefault(int(team), [])
+            # The opponent plays at the opposite venue.
+            suffix = "away" if is_home else "home"
+            entry.append({
+                "difficulty": fixture.get(difficulty_key) or 3,
+                "home": 1.0 if is_home else 0.0,
+                "opp_attack": rating(int(opponent), f"strength_attack_{suffix}"),
+                "opp_defence": rating(int(opponent), f"strength_defence_{suffix}"),
+                "opp_overall": rating(int(opponent), f"strength_overall_{suffix}"),
+            })
+
+    context = {}
+    for team, entries in gathered.items():
+        context[team] = {
+            "next_fixture_count": float(len(entries)),
+            "next_difficulty": float(np.mean([e["difficulty"] for e in entries])),
+            "next_was_home": float(np.mean([e["home"] for e in entries])),
+            "next_opp_attack": float(np.mean([e["opp_attack"] for e in entries])),
+            "next_opp_defence": float(np.mean([e["opp_defence"] for e in entries])),
+            "next_opp_overall": float(np.mean([e["opp_overall"] for e in entries])),
+            # Live opponent form is not reconstructed here; the season-long
+            # ratings above stand in for it.
+            "next_opp_conceded_r5": 0.0,
+            "next_opp_scored_r5": 0.0,
+        }
+    return context
+
+
+def apply_upcoming_fixtures(latest, fixtures, gameweek, season=None):
+    """
+    Fill the next-gameweek columns for prediction rows.
 
     On the most recent row of a season there is no following row to shift from,
     so these columns are null. They are not unknown, though -- the fixture list is
@@ -582,20 +741,8 @@ def apply_upcoming_fixtures(latest, fixtures, gameweek):
     than defaulted to an average difficulty, which is what previously let the
     optimizer buy into a blank gameweek.
     """
-    context = upcoming_fixture_context(fixtures, gameweek)
-    out = latest.copy()
-
-    counts, difficulties, homes = [], [], []
-    for team in out["team_id"]:
-        n, difficulty, home = context.get(int(team), (0, 0.0, 0.0))
-        counts.append(n)
-        difficulties.append(difficulty)
-        homes.append(home)
-
-    out["next_fixture_count"] = counts
-    out["next_difficulty"] = difficulties
-    out["next_was_home"] = homes
-    return out
+    context = upcoming_fixture_context(fixtures, gameweek, season)
+    return apply_fixture_context(latest, context)
 
 
 if __name__ == "__main__":
