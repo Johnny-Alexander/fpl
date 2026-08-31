@@ -159,6 +159,29 @@ Shrinkage, the evidence gate and the two-stage model all remain available behind
 flags (`features.DEFAULT_SHRINK`, `--min-evidence`, `--model two-stage`) and are
 off by default.
 
+**Retested on other seasons.** Every one of those paired tests originally ran on
+2025-26, which the percentile benchmark then showed to be anomalous — the first
+eight-chip season and a low-scoring one. Re-running them on 2023-24 and 2024-25,
+paired across 30 gameweeks:
+
+| Arm | mean diff | better in | p |
+|---|---:|---:|---:|
+| opponent features | −0.087 | 12/30 | 0.56 |
+| two-stage | +0.064 | 15/30 | 0.68 |
+| two-stage + opponent | −0.122 | 12/30 | 0.49 |
+| shrinkage | +0.009 | 12/30 | 0.96 |
+
+None replicate. An interaction never tried before — opponent detail *inside* the
+two-stage model, on the theory that fixtures matter more for players who actually
+start — is the worst arm of the four, and worse than two-stage alone in both
+seasons.
+
+The one honest caveat: two-stage improved MAE and rank correlation in all three
+seasons tested, and top-15 realised was directionally positive in all three
+(+0.046, +0.004, +0.125). Consistent, and far too small to establish. It is
+probably a slightly better predictor whose edge does not survive into squad
+selection.
+
 **Why the horizon failed is the most useful thing here.** The planner works — its
 unit tests show it banking transfers and timing a purchase to the week a fixture
 run begins. But across a five-week horizon a player's predicted points vary by
