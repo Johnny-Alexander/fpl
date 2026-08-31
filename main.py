@@ -52,7 +52,7 @@ def build_player_table(bootstrap, panel, model, feature_cols, season, min_chance
     # The upcoming gameweek's fixtures are published, so fill that context from
     # the live list rather than leaving it null on the season's last row.
     fixtures = data_fetcher.get_fixtures()
-    latest = features.apply_upcoming_fixtures(latest, fixtures, gameweek)
+    latest = features.apply_upcoming_fixtures(latest, fixtures, gameweek, season)
     blanks = int((latest["next_fixture_count"] == 0).sum())
     doubles = int((latest["next_fixture_count"] >= 2).sum())
     print(f"  GW{gameweek} fixtures: {blanks} players blank, {doubles} on a double")
