@@ -152,7 +152,7 @@ obviously wrong, and fixing it did not help.
 | `log_career_gws` as a model feature | −62 points over the 2025-26 backtest (1996 → 1934). |
 | Minimum-evidence gate on transfers in | Worse at every threshold: 1934 ungated, 1865 at 5, 1921 at 10 and 20. |
 | Multi-gameweek horizon (plan 3–8 weeks, transfer chain, banked free transfers) | Horizon 3 mean −30, better in 1 of 4 seasons; horizon 5 mean +23, better in 3 of 4 but p≈0.53. Diagnosis below. Available as `--horizon N` in the backtest, default 1. |
-| Richer opponent features (attack/defence strength by venue, rolling goals scored and conceded) | No help on either question. Weekly: top-15 paired over 29 folds 4.455 vs 4.577, p=0.27; starters MAE 2.238 → 2.242. Horizon: cross-week variation ratio 0.07 → 0.116, still far short of what planning needs. Behind `features.USE_OPPONENT_FEATURES`. |
+| Richer opponent features (attack/defence strength by venue, rolling goals scored and conceded) | No help on any of three tests. Weekly: top-15 paired over 29 folds 4.455 vs 4.577, p=0.27; starters MAE 2.238 → 2.242. Horizon: cross-week variation ratio 0.07 → 0.116, still far short of what planning needs. Full-season backtest across four seasons: transfers 56th → 57th percentile, chips 70th → 62nd. Behind `features.USE_OPPONENT_FEATURES`. |
 | Two-stage model, P(60+ mins) × E[points \| played] | Marginally better at prediction (starters MAE 2.225 vs 2.238, rank ρ 0.363 vs 0.354) but no better at picking squads: top-15 paired over 29 folds 4.623 vs 4.577, p=0.76; backtest 1955 vs 1996. Kept as `--model two-stage` for its calibrated start probability. |
 
 Shrinkage, the evidence gate and the two-stage model all remain available behind
@@ -170,6 +170,23 @@ paired across 30 gameweeks:
 | two-stage | +0.064 | 15/30 | 0.68 |
 | two-stage + opponent | −0.122 | 12/30 | 0.49 |
 | shrinkage | +0.009 | 12/30 | 0.96 |
+
+The four-season backtest is worth reading on its own, because it isolates what
+the earlier headline actually rested on:
+
+| arm | off | on |
+|---|---:|---:|
+| hold | 32nd | 27th |
+| transfers | 56th | 57th |
+| + chips | 70th | 62nd |
+
+The chips row looks like a real loss until 2025-26 is set aside, at which point
+the two are identical: 66/64/55 off against 72/65/48 on, both averaging the 61.7th
+percentile. The features change nothing on the three ordinary seasons. The entire
+gap is that they fail to reproduce 2025-26's 96th percentile — the anomalous
+season the percentile benchmark was built to catch. That a five-feature change
+swings one season by 285 points and the other three by nothing is a better
+argument that the 2250 was luck than any test aimed at it directly.
 
 None replicate. An interaction never tried before — opponent detail *inside* the
 two-stage model, on the theory that fixtures matter more for players who actually
