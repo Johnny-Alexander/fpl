@@ -90,6 +90,9 @@ python3 evaluate.py                      # walk-forward evaluation vs naive base
 python3 backtest/backtest.py             # full-season simulation + worm graph
 python3 backtest/validate.py             # replicate across four seasons
 python3 benchmark.py --backtest          # place those totals in the real population
+
+python3 weekly.py --force --dry-run --out /tmp/preview.html   # build this week's report
+python3 tracker.py                       # ledger: model vs you, week by week
 ```
 
 Your team id is in the URL when you are logged in:
@@ -109,12 +112,52 @@ Your team id is in the URL when you are logged in:
 | `chips.py` | chip allocation, valuation and timing |
 | `backtest/` | full-season simulation, multi-season replication, worm graph |
 | `benchmark.py` | samples real managers to turn totals into percentiles |
+| `weekly.py` | deadline-aware job: build, record, email |
+| `report.py` | email charts and HTML |
+| `tracker.py` | the prediction ledger and its scoring |
 | `setup_data.sh` | fetches the historical dataset |
 
 Data flows one way: raw gameweek CSVs → dense player-gameweek panel keyed on
 stable `code` → features → model → predicted points → MILP → squad. Season-local
 FPL ids only exist at the two ends, where the API is read and where a
 recommendation is printed.
+
+## Weekly report (live 2026-27 tracking)
+
+The backtests are finished; this season is the live test. `weekly.py` emails a
+report about a day before each deadline and appends the recommendation to a
+ledger, so what the model said is fixed before the gameweek is played.
+
+The ledger is the point, not the email. It answers the one open question the
+backtests could not: the model's single strong season (2025-26, 96th percentile)
+was also the first with eight chips, when managers were still adapting to the
+rule change. Whether the edge survives a season where they are not is only
+answerable forward.
+
+```bash
+cp .env.example .env          # then fill in an Outlook app password
+python3 weekly.py --force --dry-run --out /tmp/preview.html   # see it
+python3 weekly.py --force     # build, send, record
+python3 tracker.py            # model vs you, week by week
+```
+
+Install the schedule:
+
+```bash
+cp schedule/com.fpl.weekly.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.fpl.weekly.plist
+```
+
+It runs every six hours and does nothing unless a deadline is within 30 hours and
+that gameweek is not already recorded. Six-hourly sounds excessive for a weekly
+email; it is not. Deadlines this season sit 2 to 21 days apart, and sampling once
+a day steps time-to-deadline down by exactly 24 hours a run, which can jump clean
+over a narrower window. Simulated against all 38 deadlines, this fires for every
+one, 24.3 to 29.8 hours ahead.
+
+**A report 24 hours out predates Friday press conferences**, so it can name a
+player who is ruled out hours later. It is a planning aid; check team news before
+confirming.
 
 ## Things worth knowing
 

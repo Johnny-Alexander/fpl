@@ -347,7 +347,9 @@ def live_gameweek_rows(bootstrap, fixtures, gw, season):
             continue
         stats = entry.get("stats", {})
         team_id = int(meta["team"])
-        count, difficulty, home = context.get(team_id, (0, 0.0, 0.0))
+        # upcoming_fixture_context returns a mapping per team, not a tuple; the
+        # keys are already the next_* column names.
+        fixture = context.get(team_id, {})
 
         row = {
             "season": season,
@@ -361,10 +363,16 @@ def live_gameweek_rows(bootstrap, fixtures, gw, season):
             "selected": float(meta.get("selected_by_percent") or 0) / 100.0 * total_players,
             "transfers_balance": float(meta.get("transfers_in_event") or 0)
             - float(meta.get("transfers_out_event") or 0),
-            "was_home": home,
-            "match_difficulty": difficulty,
-            "fixture_count": count,
+            "was_home": fixture.get("next_was_home", 0.0),
+            "match_difficulty": fixture.get("next_difficulty", 0.0),
+            "fixture_count": fixture.get("next_fixture_count", 0.0),
+            "opponent_team": 0,
         }
+        # The opponent columns this row carries describe the fixture just played;
+        # the live endpoint does not report it, so they stay neutral and are
+        # overwritten by the shift that builds next_* features.
+        for opponent_stat in OPPONENT_STATS:
+            row[opponent_stat] = 0.0
         for stat in SUM_STATS:
             row[stat] = float(stats.get(stat) or 0)
         rows.append(row)

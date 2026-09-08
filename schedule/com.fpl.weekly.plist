@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.fpl.weekly</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3</string>
+    <string>/Users/johnnyalexander/Desktop/claude/fpl/weekly.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/johnnyalexander/Desktop/claude/fpl</string>
+
+  <!-- Every six hours. The job decides for itself whether a deadline is close,
+       so running often is cheap and running rarely would miss midweek rounds. -->
+  <key>StartInterval</key>
+  <integer>21600</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/johnnyalexander/Desktop/claude/fpl/tracking/weekly.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/johnnyalexander/Desktop/claude/fpl/tracking/weekly.log</string>
+</dict>
+</plist>

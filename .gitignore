@@ -16,3 +16,9 @@ backtest/output/
 
 # Cached FPL API responses
 .cache/
+
+# Local credentials - never commit
+.env
+
+# Job output; the ledger beside it IS tracked, it is the experiment record
+tracking/*.log
