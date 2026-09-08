@@ -129,12 +129,63 @@ def compose(recommendation, history, images, to_address, from_address):
     return message
 
 
+def tls_context():
+    """
+    A TLS context with a certificate bundle that actually resolves.
+
+    Python installed from python.org on macOS ships no CA bundle of its own and
+    does not read the system keychain, so ssl.create_default_context() trusts
+    nothing and every STARTTLS fails with CERTIFICATE_VERIFY_FAILED. The bundled
+    "Install Certificates.command" fixes it per machine; pointing at certifi
+    fixes it wherever this runs, which is what a scheduled job needs.
+    """
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 def send(message, host, port, user, password):
-    context = ssl.create_default_context()
+    context = tls_context()
     with smtplib.SMTP(host, port, timeout=30) as server:
         server.starttls(context=context)
         server.login(user, password)
         server.send_message(message)
+
+
+def diagnose_send_failure(error):
+    """
+    Turn the common SMTP failures into something actionable.
+
+    Each of these cost real time to identify once; the message should not have to
+    be worked out again from a numeric code.
+    """
+    text = str(error)
+    if "5.7.139" in text or "basic authentication is disabled" in text.lower():
+        return [
+            "Microsoft has basic SMTP auth switched off for this account.",
+            "First try: Outlook.com > Settings > Mail > Sync email >",
+            "  'Let devices and apps use POP' = Yes. That gate also governs SMTP.",
+            "If that does not clear it, Microsoft has retired basic auth for the",
+            "account and no app password will work. Send from a Gmail address",
+            "instead (app passwords still work there) by setting",
+            "FPL_SMTP_HOST=smtp.gmail.com, or use a transactional provider.",
+        ]
+    if "CERTIFICATE_VERIFY_FAILED" in text:
+        return [
+            "No CA bundle. `pip install certifi`, or run",
+            "  '/Applications/Python 3.14/Install Certificates.command'.",
+        ]
+    if "5.7.57" in text or "must issue a STARTTLS" in text.lower():
+        return ["The server wants STARTTLS before AUTH; check FPL_SMTP_PORT is 587."]
+    if "Username and Password not accepted" in text or "5.7.8" in text:
+        return [
+            "Credentials rejected. For Gmail this must be an app password, not",
+            "the account password, and 2FA has to be on to generate one.",
+        ]
+    return []
 
 
 def main():
@@ -146,6 +197,11 @@ def main():
                         help="ignore the deadline window")
     parser.add_argument("--dry-run", action="store_true",
                         help="build and save the report but do not send or record")
+    parser.add_argument("--no-record", action="store_true",
+                        help="send the email but leave the ledger alone. For test "
+                             "sends: recording now would consume the gameweek's slot "
+                             "and make the scheduled run skip it, so the kept "
+                             "prediction would be the older one")
     parser.add_argument("--out", default=None, help="also write the HTML here")
     parser.add_argument("--max-hours", type=float, default=DEFAULT_MAX_HOURS,
                         help="send on the first run within this many hours of the deadline")
@@ -213,8 +269,9 @@ def main():
               "FPL_EMAIL_TO) - report built but not sent")
         # Still record: the ledger is the experiment, and it must not depend on
         # whether the email happened to go out.
-        tracker.record(recommendation)
-        print(f"  recorded GW{recommendation['gameweek']} in the ledger")
+        if not args.no_record:
+            tracker.record(recommendation)
+            print(f"  recorded GW{recommendation['gameweek']} in the ledger")
         return 1
 
     try:
@@ -222,12 +279,18 @@ def main():
         print(f"  sent to {to_address}")
     except Exception as error:                      # noqa: BLE001 - reported, not raised
         print(f"  SEND FAILED: {type(error).__name__}: {error}")
-        tracker.record(recommendation)
-        print(f"  recorded GW{recommendation['gameweek']} anyway")
+        for line in diagnose_send_failure(error):
+            print(f"    {line}")
+        if not args.no_record:
+            tracker.record(recommendation)
+            print(f"  recorded GW{recommendation['gameweek']} anyway")
         return 1
 
-    tracker.record(recommendation)
-    print(f"  recorded GW{recommendation['gameweek']} in the ledger")
+    if args.no_record:
+        print("  ledger untouched (--no-record)")
+    else:
+        tracker.record(recommendation)
+        print(f"  recorded GW{recommendation['gameweek']} in the ledger")
     return 0
 
 
