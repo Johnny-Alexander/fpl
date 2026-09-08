@@ -59,7 +59,12 @@ def load_env(path=ENV_FILE):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+            key, value = key.strip(), value.strip().strip('"').strip("'")
+            # Google displays app passwords in four space-separated groups; the
+            # spaces are presentational and the server rejects them.
+            if key == "FPL_SMTP_PASSWORD":
+                value = value.replace(" ", "")
+            os.environ.setdefault(key, value)
 
 
 def hours_to_deadline(bootstrap, gameweek):
