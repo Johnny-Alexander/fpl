@@ -37,6 +37,7 @@ import report
 import tracker
 
 ENV_FILE = os.path.join(PROJECT_DIR, ".env")
+HEARTBEAT = os.path.join(PROJECT_DIR, "tracking", "last_check")
 # Send on the first run that falls inside this many hours of the deadline.
 #
 # A window with both a floor and a ceiling looks natural and is a trap: sampling
@@ -215,24 +216,28 @@ def main():
     load_env()
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
+    # Running every half hour would bury real events under no-op lines, so the
+    # log records what happened and a heartbeat file records that it looked.
+    try:
+        os.makedirs(os.path.dirname(HEARTBEAT), exist_ok=True)
+        with open(HEARTBEAT, "w") as fh:
+            fh.write(stamp + "\n")
+    except OSError:
+        pass
+
     bootstrap = data_fetcher.get_bootstrap_static()
     gameweek = data_fetcher.get_current_gameweek(bootstrap)
     hours, moment = hours_to_deadline(bootstrap, gameweek)
 
     if hours is None:
-        print(f"[{stamp}] no deadline listed for GW{gameweek}; nothing to do")
         return 0
 
     if not args.force and not (MIN_HOURS <= hours <= args.max_hours):
-        detail = "already passed" if hours < MIN_HOURS else "still too far out"
-        print(f"[{stamp}] GW{gameweek} deadline is {hours:.1f}h away "
-              f"({detail}, ceiling {args.max_hours:.0f}h); nothing to do")
         return 0
 
     already = {e["gameweek"] for e in tracker.entries()
                if e.get("season") == recommender.identity.current_season_label(bootstrap)}
     if gameweek in already and not args.force:
-        print(f"[{stamp}] GW{gameweek} already recorded; nothing to do")
         return 0
 
     print(f"[{stamp}] GW{gameweek} deadline {moment:%a %d %b %H:%M} UTC "

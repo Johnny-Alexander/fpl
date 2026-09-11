@@ -14,10 +14,14 @@
   <key>WorkingDirectory</key>
   <string>/Users/johnnyalexander/Desktop/claude/fpl</string>
 
-  <!-- Every six hours. The job decides for itself whether a deadline is close,
-       so running often is cheap and running rarely would miss midweek rounds. -->
+  <!-- Every thirty minutes. This is not about precision: a laptop that sleeps on
+       battery runs nothing while asleep, and DarkWake maintenance windows do not
+       run LaunchAgents, so a six-hourly job simply never fired -- it missed its
+       first real deadline entirely. Checking often means any half-hour the
+       machine happens to be awake inside the window is enough. A check costs one
+       cached read, about 8ms, and the ledger refuses duplicate gameweeks. -->
   <key>StartInterval</key>
-  <integer>21600</integer>
+  <integer>1800</integer>
 
   <key>RunAtLoad</key>
   <true/>
