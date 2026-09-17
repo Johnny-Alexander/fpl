@@ -63,6 +63,39 @@ def load_env(path=ENV_FILE):
             os.environ.setdefault(key, value)
 
 
+# Sender domain -> SMTP host. Deriving the host from the address that is doing
+# the authenticating removes a whole class of misconfiguration: a constant
+# default is silently wrong whenever the sender changes provider, and the
+# resulting error is an ordinary-looking authentication failure. That cost a
+# failed CI run, where .env is absent and the default sent Gmail credentials to
+# Microsoft's server.
+SMTP_HOSTS = {
+    "gmail.com": "smtp.gmail.com",
+    "googlemail.com": "smtp.gmail.com",
+    "outlook.com": "smtp-mail.outlook.com",
+    "hotmail.com": "smtp-mail.outlook.com",
+    "hotmail.co.uk": "smtp-mail.outlook.com",
+    "live.com": "smtp-mail.outlook.com",
+    "live.co.uk": "smtp-mail.outlook.com",
+    "yahoo.com": "smtp.mail.yahoo.com",
+    "icloud.com": "smtp.mail.me.com",
+    "me.com": "smtp.mail.me.com",
+}
+
+
+def smtp_host_for(user, override=None):
+    """
+    The SMTP host to use, inferred from the sending address unless overridden.
+
+    An explicit FPL_SMTP_HOST always wins; this only supplies the default, so a
+    provider not in the table is a configuration line rather than a failure.
+    """
+    if override:
+        return override
+    domain = (user or "").rpartition("@")[2].lower()
+    return SMTP_HOSTS.get(domain, "smtp-mail.outlook.com")
+
+
 def hours_to_deadline(bootstrap, gameweek):
     deadline = recommender.deadline_for(bootstrap, gameweek)
     if not deadline:
@@ -245,7 +278,7 @@ def main():
     to_address = os.environ.get("FPL_EMAIL_TO")
     user = os.environ.get("FPL_SMTP_USER")
     password = os.environ.get("FPL_SMTP_PASSWORD")
-    host = os.environ.get("FPL_SMTP_HOST", "smtp-mail.outlook.com")
+    host = smtp_host_for(user, os.environ.get("FPL_SMTP_HOST"))
     port = int(os.environ.get("FPL_SMTP_PORT", "587"))
 
     message = compose(recommendation, history, images,
@@ -274,8 +307,7 @@ def main():
               "FPL_EMAIL_TO) - report built but not sent")
         # Still record: the ledger is the experiment, and it must not depend on
         # whether the email happened to go out.
-        if not args.no_record:
-            tracker.record(recommendation)
+        if not args.no_record and tracker.record(recommendation):
             print(f"  recorded GW{recommendation['gameweek']} in the ledger")
         return 1
 
@@ -286,8 +318,7 @@ def main():
         print(f"  SEND FAILED: {type(error).__name__}: {error}")
         for line in diagnose_send_failure(error):
             print(f"    {line}")
-        if not args.no_record:
-            tracker.record(recommendation)
+        if not args.no_record and tracker.record(recommendation):
             print(f"  recorded GW{recommendation['gameweek']} anyway")
         return 1
 
