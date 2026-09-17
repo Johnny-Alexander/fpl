@@ -34,20 +34,15 @@ sys.path.insert(0, PROJECT_DIR)
 import data_fetcher
 import main as recommender
 import report
+import schedule_check
 import tracker
 
 ENV_FILE = os.path.join(PROJECT_DIR, ".env")
 HEARTBEAT = os.path.join(PROJECT_DIR, "tracking", "last_check")
-# Send on the first run that falls inside this many hours of the deadline.
-#
-# A window with both a floor and a ceiling looks natural and is a trap: sampling
-# every 24 hours moves the time-to-deadline by exactly 24 each run, so a window
-# narrower than the sampling period can be stepped straight over -- 30 hours out
-# on one run, 6 on the next, never inside a 20-28 band. A ceiling plus the
-# ledger's refusal to record a gameweek twice cannot miss, whatever the schedule.
-# Paired with the 6-hourly job this fires between 24 and 30 hours before.
-DEFAULT_MAX_HOURS = 30.0
-MIN_HOURS = 1.5  # below this the report arrives too late to act on
+# The send window lives in schedule_check, which the CI gate also imports, so the
+# cheap pre-flight check and the job itself cannot disagree about when to send.
+DEFAULT_MAX_HOURS = schedule_check.MAX_HOURS
+MIN_HOURS = schedule_check.MIN_HOURS
 
 
 def load_env(path=ENV_FILE):
