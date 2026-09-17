@@ -36,6 +36,30 @@ jobs:
         id: check
         run: python3 schedule_check.py --github-output
 
+      # Fail loudly and early on a missing or misnamed secret. Without this the
+      # job builds the whole report first and then dies at the send, which looks
+      # identical to a credential being rejected.
+      - name: Check secrets are present
+        if: steps.check.outputs.due == 'true' || inputs.force
+        env:
+          FPL_SMTP_USER: ${{ secrets.FPL_SMTP_USER }}
+          FPL_SMTP_PASSWORD: ${{ secrets.FPL_SMTP_PASSWORD }}
+          FPL_EMAIL_TO: ${{ secrets.FPL_EMAIL_TO }}
+        run: |
+          missing=
+          for name in FPL_SMTP_USER FPL_SMTP_PASSWORD FPL_EMAIL_TO; do
+            if [ -z "${!name}" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing"
+            echo "Add them at Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          echo "all three secrets present"
+          echo "  user length:     ${#FPL_SMTP_USER}"
+          echo "  password length: ${#FPL_SMTP_PASSWORD} (16 expected for a Gmail app password)"
+          echo "  recipient length:${#FPL_EMAIL_TO}"
+
       - uses: actions/setup-python@v5
         if: steps.check.outputs.due == 'true' || inputs.force
         with:
