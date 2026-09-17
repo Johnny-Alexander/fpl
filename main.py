@@ -7,6 +7,7 @@ silently attach one player's form to another's name.
 """
 
 import argparse
+import datetime as dt
 
 import pandas as pd
 
@@ -52,7 +53,7 @@ def build_player_table(bootstrap, panel, model, feature_cols, season, min_chance
     # The upcoming gameweek's fixtures are published, so fill that context from
     # the live list rather than leaving it null on the season's last row.
     fixtures = data_fetcher.get_fixtures()
-    latest = features.apply_upcoming_fixtures(latest, fixtures, gameweek)
+    latest = features.apply_upcoming_fixtures(latest, fixtures, gameweek, season)
     blanks = int((latest["next_fixture_count"] == 0).sum())
     doubles = int((latest["next_fixture_count"] >= 2).sum())
     print(f"  GW{gameweek} fixtures: {blanks} players blank, {doubles} on a double")
@@ -253,6 +254,211 @@ def print_squad(squad):
         print(f"\n  Captain: {captain.iloc[0]['web_name']} "
               f"({captain.iloc[0]['predicted_points']:.2f} pred -> "
               f"{captain.iloc[0]['predicted_points'] * 2:.2f} doubled)")
+
+
+def deadline_for(bootstrap, gameweek):
+    """ISO deadline for a gameweek, or None if the API does not list it."""
+    for event in bootstrap.get("events", []):
+        if int(event["id"]) == int(gameweek):
+            return event.get("deadline_time")
+    return None
+
+
+def _player_row(row, element_id=None, predicted_key="predicted_points"):
+    """
+    The subset of a player's fields worth recording or rendering.
+
+    `element_id` is passed explicitly when the row comes from an id-indexed
+    frame, where the id is the index rather than a column.
+    """
+    return {
+        "element_id": int(element_id if element_id is not None else row["element_id"]),
+        "code": int(row["code"]) if "code" in row and pd.notna(row["code"]) else None,
+        "name": str(row["web_name"]),
+        "position": int(row["position"]),
+        "team": int(row["team"]) if "team" in row and pd.notna(row["team"]) else None,
+        "price": float(row["value"]) / 10.0,
+        "predicted": round(float(row[predicted_key]), 2),
+        "form_3gw": round(float(row.get("total_points_rolling_3", 0.0)), 1),
+        "minutes_3gw": round(float(row.get("minutes_rolling_3", 0.0)), 0),
+        "status": str(row.get("status_label", "")),
+    }
+
+
+def build_recommendation(
+    team_id=DEFAULT_TEAM_ID,
+    free_transfers=1,
+    max_transfers=3,
+    options=3,
+    model_kind=ml_model.DEFAULT_MODEL,
+    min_chance=75,
+    min_evidence=0,
+    wildcard=False,
+    chips_used=(),
+    log=print,
+):
+    """
+    Run the whole pipeline and return the recommendation as plain data.
+
+    The CLI renders this, and so does the emailed report, so the two can never
+    drift apart: a change to the model shows up in both or neither.
+    """
+    warnings = []
+
+    def note(message):
+        warnings.append(message)
+        log(message)
+
+    bootstrap = data_fetcher.get_bootstrap_static()
+    season = identity.current_season_label(bootstrap)
+    gameweek = data_fetcher.get_current_gameweek(bootstrap)
+    log(f"Season {season}, planning GW{gameweek}")
+
+    squad_ids, budget, bank = [], 1000, 0
+    entry = data_fetcher.get_user_team(team_id, gameweek - 1) if gameweek > 1 else None
+    if entry:
+        squad_ids = [p["element"] for p in entry["picks"]]
+        bank = entry["entry_history"]["bank"]
+        elements = pd.DataFrame(bootstrap["elements"])
+        held = elements[elements["id"].isin(squad_ids)]
+        budget = int(held["now_cost"].sum()) + bank
+        log(f"Squad loaded from GW{gameweek - 1}. Budget £{budget / 10:.1f}m "
+            f"(bank £{bank / 10:.1f}m)")
+        log("  note: budget uses current prices; true selling price may be lower "
+            "on risen players")
+    else:
+        note("No squad found for the previous gameweek - running wildcard mode.")
+
+    if wildcard:
+        squad_ids = []
+
+    log(f"\nTraining {model_kind} on {', '.join(TRAINING_SEASONS)}...")
+    fixtures = data_fetcher.get_fixtures()
+    labelled, feature_cols, panel = features.prepare(
+        TRAINING_SEASONS, bootstrap=bootstrap, fixtures=fixtures
+    )
+    model = ml_model.train_model(labelled, feature_cols, kind=model_kind)
+    log(f"  {len(labelled):,} training rows, {len(feature_cols)} features")
+
+    players, matched = build_player_table(
+        bootstrap, panel, model, feature_cols, season, min_chance, gameweek
+    )
+    log(f"  matched {matched}/{len(players)} live players to historical form by code")
+
+    players, dropped = apply_availability_gate(players, squad_ids)
+    log(f"  availability gate removed {dropped} unavailable players")
+
+    players, thin = apply_evidence_gate(players, squad_ids, min_evidence)
+    if min_evidence > 0:
+        log(f"  evidence gate removed {thin} players with under "
+            f"{min_evidence} career gameweeks")
+
+    result = {
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "season": season,
+        "gameweek": gameweek,
+        "deadline": deadline_for(bootstrap, gameweek),
+        "team_id": team_id,
+        "model": model_kind,
+        "n_features": len(feature_cols),
+        "training_rows": int(len(labelled)),
+        "squad_before": squad_ids,
+        "bank": bank / 10.0,
+        "budget": budget / 10.0,
+        "free_transfers": free_transfers,
+        "wildcard": bool(wildcard or not squad_ids),
+        "options": [],
+        "squad": [],
+        "captain": None,
+        "predicted_xi_points": None,
+        "chips": [],
+        "warnings": warnings,
+    }
+
+    form_through = players["form_through_gw"].dropna()
+    result["form_through_gw"] = int(form_through.max()) if len(form_through) else None
+
+    if squad_ids:
+        squads = optimize_squad(
+            players, free_transfers=free_transfers, current_squad_ids=squad_ids,
+            budget=budget, n=options, hard_max_transfers=max_transfers,
+        )
+    else:
+        squads = optimize_squad(
+            players, free_transfers=15, current_squad_ids=None, budget=budget, n=1,
+        )
+
+    if not squads:
+        note("No feasible squad found.")
+        return result
+
+    indexed = players.set_index("element_id")
+    for squad in squads:
+        new_ids, old_ids = set(squad["element_id"]), set(squad_ids)
+        out_ids, in_ids = old_ids - new_ids, new_ids - old_ids
+        pairs = pair_transfers(out_ids, in_ids, players) if out_ids else []
+        hits = max(0, len(out_ids) - free_transfers)
+        gain = sum(
+            indexed.at[i, "predicted_points"] - indexed.at[o, "predicted_points"]
+            for o, i in pairs
+        )
+        result["options"].append({
+            "n_transfers": len(out_ids),
+            "hit_points": hits * 4,
+            "expected_gain": round(float(gain), 2),
+            "net_gain": round(float(gain - hits * 4), 2),
+            "moves": [
+                {"out": _player_row(indexed.loc[o], element_id=o),
+                 "in": _player_row(indexed.loc[i], element_id=i)}
+                for o, i in pairs
+            ],
+        })
+
+    best = squads[0]
+    result["squad"] = [_player_row(row) for _, row in best.iterrows()]
+    for entry_row, (_, row) in zip(result["squad"], best.iterrows()):
+        entry_row["is_starter"] = bool(row["is_starter"])
+        entry_row["is_captain"] = bool(row["is_captain"])
+
+    starters = [p for p in result["squad"] if p["is_starter"]]
+    captains = [p for p in result["squad"] if p["is_captain"]]
+    result["captain"] = captains[0] if captains else None
+    result["predicted_xi_points"] = round(
+        sum(p["predicted"] for p in starters)
+        + (result["captain"]["predicted"] if result["captain"] else 0.0), 2
+    )
+
+    result["chips"] = chip_options(squad_ids, players, gameweek, bootstrap, chips_used)
+    return result
+
+
+def chip_options(squad_ids, players, gameweek, bootstrap, used=()):
+    """Chip availability and whether each clears its bar, as data."""
+    if not squad_ids:
+        return []
+    state = chips.ChipState(chips.windows_from_bootstrap(bootstrap))
+    for code in used:
+        state.mark_played(code, gameweek)
+
+    predictions = dict(zip(players["element_id"], players["predicted_points"]))
+    held = [i for i in squad_ids if i in predictions]
+    gains = {
+        "TC": chips.triple_captain_gain(held, predictions),
+        "BB": chips.bench_boost_gain(held, predictions),
+    }
+
+    out = []
+    for _, code, weeks_left in state.available(gameweek):
+        entry = {"chip": code, "weeks_left": int(weeks_left)}
+        if code in gains:
+            bar = state.threshold(code, gameweek)
+            entry.update(value=round(float(gains[code]), 1),
+                         bar=round(float(bar), 1),
+                         verdict="play" if gains[code] >= bar else "hold")
+        else:
+            entry.update(value=None, bar=None, verdict="rebuild needed")
+        out.append(entry)
+    return out
 
 
 def main():

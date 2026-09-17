@@ -4,3 +4,5 @@ scikit-learn
 scipy
 pulp
 matplotlib
+certifi
+highspy

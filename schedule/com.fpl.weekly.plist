@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.fpl.weekly</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3</string>
+    <string>/Users/johnnyalexander/Desktop/claude/fpl/weekly.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/johnnyalexander/Desktop/claude/fpl</string>
+
+  <!-- Every thirty minutes. This is not about precision: a laptop that sleeps on
+       battery runs nothing while asleep, and DarkWake maintenance windows do not
+       run LaunchAgents, so a six-hourly job simply never fired -- it missed its
+       first real deadline entirely. Checking often means any half-hour the
+       machine happens to be awake inside the window is enough. A check costs one
+       cached read, about 8ms, and the ledger refuses duplicate gameweeks. -->
+  <key>StartInterval</key>
+  <integer>1800</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/johnnyalexander/Desktop/claude/fpl/tracking/weekly.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/johnnyalexander/Desktop/claude/fpl/tracking/weekly.log</string>
+</dict>
+</plist>

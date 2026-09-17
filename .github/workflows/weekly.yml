@@ -1,0 +1,78 @@
+name: FPL weekly report
+
+# Four times a day. The job sends on the first run within 30 hours of a deadline,
+# so this only has to land somewhere inside that window -- and GitHub's scheduler
+# is best-effort, so the margin matters. The ledger refuses to record a gameweek
+# twice, which is what makes over-running safe.
+on:
+  schedule:
+    - cron: "0 6,12,18,0 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Send even if no deadline is close"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write        # to commit the ledger back
+
+concurrency:
+  group: fpl-weekly
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Decide before building anything. A no-op run costs seconds this way; the
+      # full environment -- dependencies plus a 118MB dataset -- takes minutes,
+      # and most runs have nothing to do.
+      - name: Is a report due?
+        id: check
+        run: python3 schedule_check.py --github-output
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.due == 'true' || inputs.force
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.check.outputs.due == 'true' || inputs.force
+        run: pip install -r requirements.txt
+
+      # Only the seasons the model reads, shallow and sparse: ~118MB rather than
+      # the 333MB full archive.
+      - name: Fetch historical data
+        if: steps.check.outputs.due == 'true' || inputs.force
+        run: ./setup_data.sh
+
+      - name: Build, send and record
+        if: steps.check.outputs.due == 'true' || inputs.force
+        env:
+          FPL_SMTP_USER: ${{ secrets.FPL_SMTP_USER }}
+          FPL_SMTP_PASSWORD: ${{ secrets.FPL_SMTP_PASSWORD }}
+          FPL_EMAIL_TO: ${{ secrets.FPL_EMAIL_TO }}
+        run: python3 weekly.py ${{ inputs.force && '--force' || '' }}
+
+      # The ledger is the experiment record. Committing it from CI puts each
+      # prediction in a git history timestamped by someone other than us, which
+      # is a far better guarantee that it was not revised after the fact than a
+      # file on a laptop.
+      - name: Commit the ledger
+        if: steps.check.outputs.due == 'true' || inputs.force
+        run: |
+          if git diff --quiet tracking/ledger.jsonl 2>/dev/null; then
+            echo "ledger unchanged"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tracking/ledger.jsonl
+          git commit -m "Record GW${{ steps.check.outputs.gameweek }} recommendation"
+          git push

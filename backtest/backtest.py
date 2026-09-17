@@ -174,16 +174,20 @@ def fixture_context_by_gw(panel, season):
     taken from the future -- only the schedule.
     """
     rows = panel[panel["season"] == season]
-    grouped = rows.groupby(["GW", "team_id"]).agg(
-        count=("fixture_count", "max"),
-        difficulty=("match_difficulty", "mean"),
-        home=("was_home", "mean"),
-    )
+    spec = {
+        "next_fixture_count": ("fixture_count", "max"),
+        "next_difficulty": ("match_difficulty", "mean"),
+        "next_was_home": ("was_home", "mean"),
+    }
+    for stat in features.OPPONENT_STATS:
+        spec[f"next_{stat}"] = (stat, "mean")
+
+    grouped = rows.groupby(["GW", "team_id"]).agg(**spec)
     context = {}
     for (gw, team), row in grouped.iterrows():
-        context.setdefault(int(gw), {})[int(team)] = (
-            float(row["count"]), float(row["difficulty"]), float(row["home"])
-        )
+        context.setdefault(int(gw), {})[int(team)] = {
+            column: float(row[column]) for column in features.NEXT_COLUMNS
+        }
     return context
 
 
