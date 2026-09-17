@@ -5,3 +5,4 @@ scipy
 pulp
 matplotlib
 certifi
+highspy

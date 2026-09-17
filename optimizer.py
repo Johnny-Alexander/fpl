@@ -22,6 +22,59 @@ MAX_FREE_TRANSFERS = 5  # FPL banks up to five
 BENCH_WEIGHT = 0.1
 
 
+# Candidate solvers, best first. HiGHS leads because pulp's bundled CBC is an
+# x86_64 binary: on Apple Silicon it ran only under Rosetta, and once Rosetta
+# went away every solve began failing with "Bad CPU type in executable". The
+# scheduled job kept running and kept crashing.
+_SOLVER_CANDIDATES = ("HiGHS", "PULP_CBC_CMD", "COIN_CMD")
+_SOLVER_NAME = None
+
+
+def _solver_works(name):
+    """
+    Whether a solver can actually solve, not merely whether pulp lists it.
+
+    pulp.listSolvers(onlyAvailable=True) reports CBC as available whenever the
+    binary file exists; it cannot tell that the file will not execute on this
+    architecture. The only honest test is a solve.
+    """
+    try:
+        probe = pulp.LpProblem("probe", pulp.LpMaximize)
+        x = pulp.LpVariable("x", 0, 1, cat="Binary")
+        probe += x
+        probe += x <= 1
+        probe.solve(pulp.getSolver(name, msg=False))
+        return probe.status == pulp.LpStatusOptimal
+    except Exception:          # noqa: BLE001 - any failure means unusable
+        return False
+
+
+def solver_name():
+    """The first candidate that genuinely solves on this machine, cached."""
+    global _SOLVER_NAME
+    if _SOLVER_NAME is None:
+        available = set(pulp.listSolvers(onlyAvailable=True))
+        for name in _SOLVER_CANDIDATES:
+            if name in available and _solver_works(name):
+                _SOLVER_NAME = name
+                break
+        else:
+            raise RuntimeError(
+                "No working MILP solver. pulp's bundled CBC is x86_64 and will "
+                "not run on Apple Silicon without Rosetta; install a native one "
+                "with `pip install highspy`."
+            )
+    return _SOLVER_NAME
+
+
+def build_solver(time_limit=None):
+    """A configured solver instance, quiet, with an optional time limit."""
+    kwargs = {"msg": False}
+    if time_limit is not None:
+        kwargs["timeLimit"] = time_limit
+    return pulp.getSolver(solver_name(), **kwargs)
+
+
 def optimize_squad(
     player_data,
     free_transfers=1,
@@ -113,7 +166,7 @@ def optimize_squad(
     # ── Solve, then re-solve for alternatives ──
     squads = []
     for _ in range(n):
-        prob.solve(pulp.PULP_CBC_CMD(msg=False))
+        prob.solve(build_solver())
         if prob.status != pulp.LpStatusOptimal:
             break
 
@@ -326,7 +379,7 @@ def optimize_horizon(
         prob += banked[gw] <= MAX_FREE_TRANSFERS
 
     prob += pulp.lpSum(objective)
-    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit))
+    prob.solve(build_solver(time_limit))
 
     if prob.status not in (pulp.LpStatusOptimal,):
         return [], []
