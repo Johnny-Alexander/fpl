@@ -2,7 +2,7 @@ pandas
 requests
 scikit-learn
 scipy
-pulp
+pulp<4  # 4.0 removed LpVariable.dicts, which optimizer.py relies on
 matplotlib
 certifi
 highspy
