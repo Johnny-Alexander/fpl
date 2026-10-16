@@ -56,6 +56,32 @@ def _player(row, shorts, owned, buying, factors):
     }
 
 
+def availability_notes(context, element_ids):
+    """
+    {element_id: {"status", "news", "if_fit"}} for players shown at zero
+    because the availability gate set them there.
+
+    The gate keeps an unavailable player the manager already owns, at zero, so
+    the optimizer can decide whether to sell. Shown bare, that zero reads as the
+    model's verdict on the player. FPL's news line says why it is zero, and the
+    model's ungated number says what is being given up while they are out.
+    """
+    players = context["players"].set_index("element_id")
+    rows = context["feature_rows"]
+    ungated = dict(zip(rows["code"].astype(int), rows["predicted_points"]))
+    notes = {}
+    for element_id in element_ids:
+        if element_id not in players.index or bool(players.at[element_id, "is_available"]):
+            continue
+        if_fit = ungated.get(int(players.at[element_id, "code"]))
+        notes[element_id] = {
+            "status": str(players.at[element_id, "status_label"] or ""),
+            "news": str(players.at[element_id, "news"] or "").strip(),
+            "if_fit": round(float(if_fit), 2) if if_fit else None,
+        }
+    return notes
+
+
 def last_review(history_rows, season):
     """
     The most recent scored gameweek: what the recommended team was predicted,
@@ -102,7 +128,9 @@ def build(context, recommendation, history_rows=()):
               model cannot be explained),
       "top": the TOP_N highest predictions among available players,
       "by_position": {position: the PER_POSITION highest in it},
-      "squad_factors": {element_id: {factor: points}} for the recommended squad,
+      "squad_factors": {element_id: {factor: points} or None} for the
+                       recommended squad and the players it transfers out,
+      "availability": availability_notes(...) for the same players,
       "fixture_weeks": [gameweek, ...],
       "fixtures": {team: {gameweek: [(opponent, difficulty, is_home), ...]}},
       "review": last_review(...) or None,
@@ -117,7 +145,8 @@ def build(context, recommendation, history_rows=()):
 
     owned = set(recommendation.get("squad_before") or [])
     options = recommendation.get("options") or []
-    buying = {move["in"]["element_id"] for move in (options[0]["moves"] if options else [])}
+    moves = options[0]["moves"] if options else []
+    buying = {move["in"]["element_id"] for move in moves}
 
     available = players[players["is_available"]].sort_values(
         "predicted_points", ascending=False
@@ -131,11 +160,12 @@ def build(context, recommendation, history_rows=()):
         by_position[int(position)] = [_player(row, shorts, owned, buying, factors)
                                       for _, row in best.iterrows()]
 
+    # The players being sold sit beside the squad in the email, so the swap can
+    # be read factor by factor.
+    shown = ([p["element_id"] for p in recommendation.get("squad") or []]
+             + [move["out"]["element_id"] for move in moves])
     codes = dict(zip(players["element_id"], players["code"]))
-    squad_factors = {
-        p["element_id"]: factors.get(int(codes.get(p["element_id"], -1)))
-        for p in recommendation.get("squad") or []
-    }
+    squad_factors = {i: factors.get(int(codes.get(i, -1))) for i in shown}
 
     last_event = max(int(e["id"]) for e in bootstrap["events"])
     weeks = max(0, min(FIXTURE_WEEKS, last_event - gameweek + 1))
@@ -147,6 +177,7 @@ def build(context, recommendation, history_rows=()):
         "top": top,
         "by_position": by_position,
         "squad_factors": squad_factors,
+        "availability": availability_notes(context, shown),
         "fixture_weeks": list(range(gameweek, gameweek + weeks)),
         "fixtures": fixtures,
         "review": last_review(history_rows, recommendation.get("season")),

@@ -410,18 +410,52 @@ def _factor_heading(factor):
             f'{swatch}<br>{FACTOR_SHORT[factor]}</td>')
 
 
-def _squad_table(squad):
-    starters = [p for p in squad if p.get("is_starter")]
-    bench = [p for p in squad if not p.get("is_starter")]
+def _tag(word):
+    """A transfer tag. The word carries the meaning; the colour only echoes it."""
+    tone, fill = (("#006300", _mix("#0ca30c", 0.16)) if word == "IN"
+                  else ("#d03b3b", _mix("#d03b3b", 0.12)))
+    return (f' <span style="font-size:10px;font-weight:700;letter-spacing:0.05em;'
+            f'color:{tone};background:{fill};padding:1px 5px;border-radius:3px;'
+            f'vertical-align:1px">{word}</span>')
+
+
+def _swap(player, moves):
+    """(tag, pairing) for a player in a recommended transfer, else empty strings."""
+    for move in moves:
+        if move["in"]["element_id"] == player["element_id"]:
+            return _tag("IN"), f'in for {move["out"]["name"]}'
+        if move["out"]["element_id"] == player["element_id"]:
+            return _tag("OUT"), f'out for {move["in"]["name"]}'
+    return "", ""
+
+
+def _squad_groups(squad, moves):
+    """
+    The squad by starting XI and bench, and the players the recommended
+    transfers sell -- listed beside the squad they leave, so the swap can be
+    read row against row rather than only from the transfer line at the top.
+    """
+    groups = [("Starting XI", [p for p in squad if p.get("is_starter")]),
+              ("Bench", [p for p in squad if not p.get("is_starter")])]
+    if moves:
+        groups.append(("Transferring out", [move["out"] for move in moves]))
+    return [(label, sorted(players, key=lambda p: (p["position"], -p["predicted"])))
+            for label, players in groups]
+
+
+def _squad_table(squad, moves=()):
     rows = []
-    for group, label in ((starters, "Starting XI"), (bench, "Bench")):
+    for label, group in _squad_groups(squad, moves):
         rows.append(f'<tr><td colspan="4" style="{STYLE_TH};padding-top:14px">{label}</td></tr>')
-        for player in sorted(group, key=lambda p: (p["position"], -p["predicted"])):
+        for player in group:
             mark = ' <span style="color:#eb6834;font-weight:600">(C)</span>' if player.get("is_captain") else ""
+            tag, pairing = _swap(player, moves)
+            pairing = (f' <span style="color:{INK_MUTED};font-size:12px">{_esc(pairing)}</span>'
+                       if pairing else "")
             rows.append(
                 f'<tr>'
                 f'<td style="{STYLE_TD};color:{INK_MUTED};width:44px">{POSITION_NAME.get(player["position"], "")}</td>'
-                f'<td style="{STYLE_TD}">{_esc(player["name"])}{mark}</td>'
+                f'<td style="{STYLE_TD}">{_esc(player["name"])}{mark}{tag}{pairing}</td>'
                 f'<td style="{STYLE_TD};text-align:right;color:{INK_SECONDARY}">£{player["price"]:.1f}m</td>'
                 f'<td style="{STYLE_TD};text-align:right">{player["predicted"]:.1f}</td>'
                 f'</tr>'
@@ -429,42 +463,63 @@ def _squad_table(squad):
     return f'<table style="{STYLE_TABLE}">{"".join(rows)}</table>'
 
 
-def _squad_factor_table(squad, factors):
+def _availability_cell(note):
+    """In place of the factor split, why a player is counted as zero."""
+    reason = (note.get("news") or note.get("status", "").capitalize() or "Unavailable").rstrip(".")
+    if_fit = f'; {note["if_fit"]:.1f} if fit' if note.get("if_fit") else ""
+    return (f'<td colspan="{len(FACTORS)}" style="{STYLE_TD};padding:6px 8px;font-size:12px;'
+            f'line-height:1.4;color:{INK_SECONDARY};background:#f4f3f0;'
+            f'border-bottom:1px solid {SURFACE}">{_esc(reason)}. Counted as 0{if_fit}.</td>')
+
+
+def _squad_factor_table(squad, factors, moves=(), notes=None):
     """
     The squad table with each prediction split by factor.
 
     Position and price move under the name so that five factor columns still
     fit a phone: the plain table's separate columns would push it past the
-    width of the screen.
+    width of the screen. A player the availability gate zeroed shows FPL's
+    news in place of the split, since the split would explain a number the
+    reader is not shown.
     """
+    notes = notes or {}
     columns = 2 + len(FACTORS)
     rows = [
         f'<tr><td style="{STYLE_TH}"></td>'
         f'<td style="{STYLE_TH_PLAIN};text-align:right;padding-right:6px">xPts</td>'
         + "".join(_factor_heading(f) for f in FACTORS) + '</tr>'
     ]
-    starters = [p for p in squad if p.get("is_starter")]
-    bench = [p for p in squad if not p.get("is_starter")]
-    for group, label in ((starters, "Starting XI"), (bench, "Bench")):
+    dashes = False
+    for label, group in _squad_groups(squad, moves):
         rows.append(f'<tr><td colspan="{columns}" style="{STYLE_TH};padding-top:14px">{label}</td></tr>')
-        for player in sorted(group, key=lambda p: (p["position"], -p["predicted"])):
+        for player in group:
             mark = ' <span style="color:#eb6834;font-weight:600">(C)</span>' if player.get("is_captain") else ""
-            parts = factors.get(player["element_id"])
+            tag, pairing = _swap(player, moves)
+            detail = f'{POSITION_NAME.get(player["position"], "")} · £{player["price"]:.1f}m'
+            if pairing:
+                detail += f" · {_esc(pairing)}"
+            note, parts = notes.get(player["element_id"]), factors.get(player["element_id"])
+            if note:
+                split = _availability_cell(note)
+            else:
+                dashes = dashes or not parts
+                split = "".join(_contribution_cell(parts[f] if parts else None) for f in FACTORS)
             rows.append(
-                f'<tr><td style="{STYLE_TD};line-height:1.3">{_esc(player["name"])}{mark}<br>'
-                f'<span style="color:{INK_MUTED};font-size:12px">'
-                f'{POSITION_NAME.get(player["position"], "")} · £{player["price"]:.1f}m</span></td>'
+                f'<tr><td style="{STYLE_TD};line-height:1.3">{_esc(player["name"])}{mark}{tag}<br>'
+                f'<span style="color:{INK_MUTED};font-size:12px">{detail}</span></td>'
                 f'<td style="{STYLE_TD};text-align:right;padding-right:6px;font-weight:600;'
                 f'font-variant-numeric:tabular-nums">{player["predicted"]:.1f}</td>'
-                + "".join(_contribution_cell(parts[f] if parts else None) for f in FACTORS)
-                + '</tr>'
+                f'{split}</tr>'
             )
+    footnote = "Each prediction split by factor, as in the chart above: blue adds points, red takes them away."
+    if moves:
+        footnote += " IN and OUT mark the recommended transfer."
+    if dashes:
+        footnote += " A dash means there is too little history to split the number."
     return (
         f'<table style="{STYLE_TABLE}">{"".join(rows)}</table>'
         f'<p style="margin:8px 0 0;color:{INK_MUTED};font-size:12px;line-height:1.5">'
-        'Each prediction split by factor, as in the chart above: blue adds points, red '
-        'takes them away. A dash means the model\'s number was overridden, usually '
-        'because the player is ruled out.</p>'
+        f'{footnote}</p>'
     )
 
 
@@ -698,11 +753,13 @@ def render_html(recommendation, history_rows, images, insights=None):
             f'style="width:100%;max-width:640px;display:block;border:0">'
         )
 
+    squad = recommendation.get("squad") or []
+    moves = options[0]["moves"] if options else []
     blocks += [
         _heading("Squad", bottom=4),
-        (_squad_factor_table(recommendation.get("squad") or [], insights["squad_factors"])
+        (_squad_factor_table(squad, insights["squad_factors"], moves, insights.get("availability"))
          if any((insights.get("squad_factors") or {}).values())
-         else _squad_table(recommendation.get("squad") or [])),
+         else _squad_table(squad, moves)),
     ]
     if recommendation.get("chips"):
         blocks += [_heading("Chips", bottom=4), _chip_block(recommendation["chips"])]
