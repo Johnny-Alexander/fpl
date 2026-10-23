@@ -29,6 +29,9 @@ def build_player_table(bootstrap, panel, model, feature_cols, season, min_chance
     The join runs through `code`, and unmatched players are reported rather than
     silently zero-filled -- a large unmatched count means the historical data has
     fallen behind the live season.
+
+    Returns (players, matched, latest): `latest` is the feature row each
+    prediction was made from, one per code, for callers that explain them.
     """
     elements = pd.DataFrame(bootstrap["elements"])
     elements["element_id"] = elements["id"].astype(int)
@@ -86,7 +89,7 @@ def build_player_table(bootstrap, panel, model, feature_cols, season, min_chance
     )
     merged["is_available"] = merged["is_available"].fillna(False)
 
-    return merged, matched
+    return merged, matched, latest
 
 
 def apply_availability_gate(players, current_squad_ids):
@@ -296,12 +299,18 @@ def build_recommendation(
     wildcard=False,
     chips_used=(),
     log=print,
+    context=None,
 ):
     """
     Run the whole pipeline and return the recommendation as plain data.
 
     The CLI renders this, and so does the emailed report, so the two can never
     drift apart: a change to the model shows up in both or neither.
+
+    Pass a dict as `context` to have it filled with what the recommendation was
+    built from -- the gated player table, the fitted model and the feature rows
+    -- for a caller that wants to look beyond the chosen squad. They are kept out
+    of the result itself, which is recorded to the ledger as JSON.
     """
     warnings = []
 
@@ -340,7 +349,7 @@ def build_recommendation(
     model = ml_model.train_model(labelled, feature_cols, kind=model_kind)
     log(f"  {len(labelled):,} training rows, {len(feature_cols)} features")
 
-    players, matched = build_player_table(
+    players, matched, latest = build_player_table(
         bootstrap, panel, model, feature_cols, season, min_chance, gameweek
     )
     log(f"  matched {matched}/{len(players)} live players to historical form by code")
@@ -352,6 +361,11 @@ def build_recommendation(
     if min_evidence > 0:
         log(f"  evidence gate removed {thin} players with under "
             f"{min_evidence} career gameweeks")
+
+    if context is not None:
+        context.update(players=players, model=model, feature_cols=feature_cols,
+                       feature_rows=latest, bootstrap=bootstrap, fixtures=fixtures,
+                       season=season, gameweek=gameweek)
 
     result = {
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -512,7 +526,7 @@ def main():
     model = ml_model.train_model(labelled, feature_cols, kind=args.model)
     print(f"  {len(labelled):,} training rows, {len(feature_cols)} features")
 
-    players, matched = build_player_table(
+    players, matched, _ = build_player_table(
         bootstrap, panel, model, feature_cols, season, args.min_chance, current_gw
     )
     print(f"  matched {matched}/{len(players)} live players to historical form by code")

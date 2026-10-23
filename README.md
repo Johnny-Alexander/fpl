@@ -114,6 +114,8 @@ Your team id is in the URL when you are logged in:
 | `benchmark.py` | samples real managers to turn totals into percentiles |
 | `weekly.py` | deadline-aware job: build, record, email |
 | `report.py` | email charts and HTML |
+| `insights.py` | the email's market view and last-gameweek review (not recorded) |
+| `attribution.py` | splits a prediction into five factors that sum to it |
 | `tracker.py` | the prediction ledger and its scoring |
 | `setup_data.sh` | fetches the historical dataset |
 
@@ -133,6 +135,28 @@ backtests could not: the model's single strong season (2025-26, 96th percentile)
 was also the first with eight chips, when managers were still adapting to the
 rule change. Whether the edge survives a season where they are not is only
 answerable forward.
+
+Besides the recommendation, the email carries context for reading it, rebuilt
+each run and never written to the ledger:
+
+- **Who the model rates** — the 20 highest predictions in the whole game, each
+  bar split into what produced it: price & ownership, form, minutes, underlying
+  stats and the fixture. Players you own and the recommended buy are marked.
+- **Best options by position** — the top five per position with price,
+  ownership and a five-gameweek fixture ticker.
+- **Squad** — your squad's predictions split into the same five factors.
+- **Last gameweek** — what each recommended starter was predicted against what
+  they scored.
+
+The factor split (`attribution.py`) is exact: Shapley values over groups of
+inputs, computed by walking the trees, so the five parts plus a shared base of
+about 1.2 points add up to the prediction. It explains the model, not football,
+and the first thing it shows is that the model leans hardest on price and
+ownership: for Haaland in GW7 they account for +4.0 of 7.0 points. Removing a
+factor by swapping in an average player's values was tried first and rejected;
+it credited Haaland's attacking numbers −0.75 despite xG and threat several
+times the average, because pairing his stats with a £5.5m price builds a player
+the trees have never seen.
 
 ```bash
 cp .env.example .env          # then fill in an Outlook app password

@@ -32,6 +32,7 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_DIR)
 
 import data_fetcher
+import insights
 import main as recommender
 import report
 import schedule_check
@@ -105,11 +106,12 @@ def hours_to_deadline(bootstrap, gameweek):
 
 
 def build(team_id, free_transfers, chips_used, quiet=True):
-    """Recommendation, ledger history, and the rendered charts."""
+    """Recommendation, ledger history, the rendered charts and the extra sections."""
     log = (lambda *a, **k: None) if quiet else print
+    context = {}
     recommendation = recommender.build_recommendation(
         team_id=team_id, free_transfers=free_transfers,
-        chips_used=chips_used, log=log,
+        chips_used=chips_used, log=log, context=context,
     )
 
     images = {}
@@ -129,10 +131,24 @@ def build(team_id, free_transfers, chips_used, quiet=True):
     if tracker_png:
         images["tracker"] = tracker_png
 
-    return recommendation, history, images
+    # The market view and the review are context for the recommendation, not
+    # part of it. A fault in them must not cost the email or the ledger entry,
+    # so they are dropped with a note in the log rather than raised.
+    extra = {}
+    try:
+        extra = insights.build(context, recommendation, history)
+        top_png = report.chart_top_players(extra["top"], extra["base"],
+                                           recommendation["gameweek"])
+        if top_png:
+            images["top"] = top_png
+    except Exception as error:                      # noqa: BLE001 - reported, not raised
+        print(f"  extra sections skipped: {type(error).__name__}: {error}")
+        extra = {}
+
+    return recommendation, history, images, extra
 
 
-def compose(recommendation, history, images, to_address, from_address):
+def compose(recommendation, history, images, to_address, from_address, extra=None):
     message = EmailMessage()
     message["Subject"] = (
         f"FPL GW{recommendation['gameweek']}: "
@@ -145,7 +161,7 @@ def compose(recommendation, history, images, to_address, from_address):
     message["To"] = to_address
 
     cids = {name: make_msgid(idstring="fpl")[1:-1] for name in images}
-    html = report.render_html(recommendation, history, images)
+    html = report.render_html(recommendation, history, images, extra)
     for name, cid in cids.items():
         html = html.replace(f"cid:{name}", f"cid:{cid}")
 
@@ -271,7 +287,7 @@ def main():
     print(f"[{stamp}] GW{gameweek} deadline {moment:%a %d %b %H:%M} UTC "
           f"({hours:.1f}h) - building report")
 
-    recommendation, history, images = build(
+    recommendation, history, images, extra = build(
         args.team_id, args.free_transfers, args.chips_used
     )
 
@@ -282,13 +298,13 @@ def main():
     port = int(os.environ.get("FPL_SMTP_PORT", "587"))
 
     message = compose(recommendation, history, images,
-                      to_address or "unset@localhost", user or "unset@localhost")
+                      to_address or "unset@localhost", user or "unset@localhost", extra)
 
     if args.out:
         # Written for a browser rather than a mail client, so the charts are
         # inlined as data URIs. Email gets the cid: form instead, which is the
         # only one most clients render without the reader loading images.
-        html = report.render_html(recommendation, history, images)
+        html = report.render_html(recommendation, history, images, extra)
         for name, data in images.items():
             encoded = base64.b64encode(data).decode("ascii")
             html = html.replace(f"cid:{name}", f"data:image/png;base64,{encoded}")
